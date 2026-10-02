@@ -1,0 +1,11 @@
+# Data and Caches
+data/*.parquet
+data/*.csv
+cache/
+output/
+
+# Python artifacts
+__pycache__/
+*.pyc
+alphagx_env/
+.env
