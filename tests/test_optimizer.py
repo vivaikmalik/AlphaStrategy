@@ -68,3 +68,18 @@ def test_null_betas_and_run_book():
     wdf, log = run_book(pl.concat(ms), 0.1, 10.0, CFG)
     assert wdf["eom"].n_unique() == 2 and len(log) == 2 and set(log[0]) >= {"beta_tol", "status", "n_long", "n_short", "turnover"}
     assert log[1]["turnover"] > 0
+
+
+def test_sector_band_relaxed_when_infeasible():
+    # longs only in sector 10, shorts only in sector 20 -> +-0.10 sector nets cannot reach 200% gross
+    m = _month(n=1000, seed=3).with_columns(
+        pl.when(pl.col("score") > 0).then(pl.lit("10")).otherwise(pl.lit("20")).alias("sector"))
+    w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
+    assert info["sector_band"] > CFG["sector_band"] and info["status"] in ("optimal", "optimal_inaccurate")
+    assert abs(sum(abs(x) for x in w.values()) - 2) < 1e-5
+
+
+def test_constant_scores_do_not_crash():
+    m = _month(n=1000, seed=4).with_columns(pl.lit(0.5).alias("score"))
+    w, info = optimize_month(m, {}, 0.1, 10.0, CFG)
+    assert abs(sum(abs(x) for x in w.values()) - 2) < 1e-5
