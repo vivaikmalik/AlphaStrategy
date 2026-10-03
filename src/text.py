@@ -9,7 +9,7 @@ def process_text_features(df_8k: pl.DataFrame, device: str = "cuda") -> pl.DataF
                      "3.01", "4.01", "4.02", "5.02", "7.01", "8.01"]
     history_items = ["4.02", "5.02", "2.06", "1.02", "2.05"]
     
-    # FIX: Generate the 'eom' column from 'filing_date'
+    # Generate the 'eom' column from 'filing_date'
     df_8k = df_8k.with_columns(
         pl.col("filing_date").cast(pl.Date).dt.month_end().alias("eom")
     )
@@ -17,10 +17,11 @@ def process_text_features(df_8k: pl.DataFrame, device: str = "cuda") -> pl.DataF
     # 1. Deduplicate and assign to filing month
     df = df_8k.unique(subset=["permno", "text_sha256"]).drop_nulls("text")
     
-    # Unpacked with_columns and over (NO LIST BRACKETS)
+    # CRITICAL FIX: Cast 'items' list[str] to String so str.contains works
     df = df.with_columns(
         pl.lit(1).alias("has_filing"),
-        pl.col("document_id").len().over("permno", "eom").alias("n_filings")
+        pl.col("document_id").len().over("permno", "eom").alias("n_filings"),
+        pl.col("items").cast(pl.String) 
     )
     
     for item in items_to_flag:
@@ -76,7 +77,6 @@ def process_text_features(df_8k: pl.DataFrame, device: str = "cuda") -> pl.DataF
             pl.col(f"item_{item.replace('.', '_')}").rolling_sum(window_size=12, min_periods=1).over("permno").alias(f"item_{item.replace('.', '_')}_12m")
         )
         
-    # Unpacked with_columns chaining
     df_monthly = df_monthly.with_columns(
         pl.col("tone_mean").rolling_mean(window_size=12, min_periods=1).over("permno").alias("tone_12m_avg")
     ).with_columns(
