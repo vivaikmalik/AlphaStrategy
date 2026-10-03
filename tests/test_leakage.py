@@ -1,4 +1,5 @@
 import polars as pl
+from datetime import date
 from src.config import CACHE_DIR
 
 def test_leakage():
@@ -8,13 +9,15 @@ def test_leakage():
         print("⚠️ Cache preprocessed_features.parquet not found, testing schema assertions on mock...")
         df = pl.DataFrame({
             "permno": [1, 2],
-            "eom": [pl.date(2020, 1, 31), pl.date(2020, 1, 31)],
+            "eom": [date(2020, 1, 31), date(2020, 1, 31)],
             "ret_exc_lead1m": [0.01, 0.02]
         })
     else:
         df = pl.read_parquet(parquet_path)
         
-    assert df.is_unique(subset=["permno", "eom"]), "Duplicate (permno, eom) observations detected"
+    # Polars 1.0+ compliant uniqueness check
+    is_unique = df.height == df.unique(subset=["permno", "eom"]).height
+    assert is_unique, "Duplicate (permno, eom) observations detected"
     print("✅ Leakage & Integrity Tests (Step 11) Verified.")
 
 if __name__ == "__main__":
