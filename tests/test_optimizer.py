@@ -83,3 +83,12 @@ def test_constant_scores_do_not_crash():
     m = _month(n=1000, seed=4).with_columns(pl.lit(0.5).alias("score"))
     w, info = optimize_month(m, {}, 0.1, 10.0, CFG)
     assert abs(sum(abs(x) for x in w.values()) - 2) < 1e-5
+
+
+def test_beta_relaxed_beyond_one_when_longs_are_high_beta():
+    # all long candidates beta ~3, all shorts ~0.5: min |beta.w| ~ 0.9*3 - 1.1*0.5 > 1, so tol must exceed 1.0
+    m = _month(n=1000, seed=5)
+    m = m.with_columns(pl.when(pl.col("score") > 0).then(3.0).otherwise(0.5).alias("beta_kf"))
+    w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
+    assert info["status"] in ("optimal", "optimal_inaccurate") and info["beta_tol"] > 1.0
+    _check(m, w, info) if info["sector_band"] == CFG["sector_band"] else None

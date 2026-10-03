@@ -725,19 +725,25 @@ def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg):
             return False                                                   # treated as a failed attempt
         return prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and w.value is not None
 
-    t, b = cfg["beta_tol"], cfg["sector_band"]
+    t, b, no_beta = cfg["beta_tol"], cfg["sector_band"], 1e6
     if not solve(t, b):
-        # Not in spec: if even beta tol 1.0 is infeasible, beta is not the binding constraint (sector nets are),
+        # Not in spec: if the month is infeasible even with NO beta limit, the sector nets bind,
         # so widen the sector band in 0.05 steps first (logged), then relax beta from 0.02 as the spec says.
-        while not solve(1.0, b):
+        while not solve(no_beta, b):
             b += 0.05
-            if b > 2.0:
-                raise RuntimeError(f"optimizer infeasible even with sector band {b:.2f} and beta tol 1.00: {prob.status}")
-        while t < 1.0 and not solve(t, b):
-            t += cfg["beta_tol_step"]                                      # spec: relax beta tolerance in 0.01 steps
-        if t >= 1.0:
-            t = 1.0
-            solve(t, b)
+            if b > 2.0:                                                    # should not happen: save inputs, hold last book
+                eom = mdf["eom"][0]
+                path = cfg["cache_dir"] / f"optimizer_fail_{eom}.parquet"
+                mdf.write_parquet(path)
+                bad = {k: int((~np.isfinite(v)).sum()) for k, v in (("s", s), ("beta_kf", bk), ("beta_var", bv))}
+                print(f"[optimizer] WARNING {eom}: infeasible ({prob.status}) even with sector band 2.0 and no beta limit; "
+                      f"rows={d.height} long_cand={len(long_ids)} short_cand={len(short_ids)} non-finite={bad}; "
+                      f"holding previous weights; inputs saved to {path}")
+                return dict(w_prev), {"beta_tol": None, "sector_band": b, "status": "fallback_hold",
+                                      "n_long": sum(v > 0 for v in w_prev.values()),
+                                      "n_short": sum(v < 0 for v in w_prev.values()), "turnover": 0.0}
+        while not solve(t, b):                                             # spec: relax beta tolerance in 0.01 steps
+            t += cfg["beta_tol_step"]                                      # terminates: feasible without a beta limit
     wv = np.where(np.abs(w.value) < 1e-7, 0.0, w.value)
     weights = {p: float(x) for p, x in zip(ids, wv) if x != 0.0}
     turnover = float(np.abs(wv - wp).sum() + dropped)
@@ -750,7 +756,7 @@ def run_book(scored, lam_tc, lam_beta, cfg):
     w_prev, rows, log = {}, [], []
     for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
         w, info = optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg)
-        if info["beta_tol"] > cfg["beta_tol"]:
+        if info["beta_tol"] is not None and info["beta_tol"] > cfg["beta_tol"]:
             print(f"[optimizer] {eom}: beta tolerance relaxed to {info['beta_tol']:.2f}")
         if info["sector_band"] > cfg["sector_band"]:
             print(f"[optimizer] {eom}: sector band relaxed to {info['sector_band']:.2f} (infeasible at 0.10)")
@@ -1227,7 +1233,7 @@ def _pipe_tune(frames, feats, market, cfg):
         rets, _ = book_returns(w, frames[d], market, cfg)
         ir = _pipe_ir(rets)
         grid.append({"d": d, "lam_tc": ltc, "lam_beta": lb, "short_me_q": q, "val_ir": ir,
-                     "n_relaxed_months": sum(1 for r in log if r.get("beta_tol", 0) > cfg["beta_tol"] + 1e-12)})
+                     "n_relaxed_months": sum(1 for r in log if (r.get("beta_tol") or 0) > cfg["beta_tol"] + 1e-12)})
         if np.isfinite(ir) and (best is None or ir > best[0]):
             best = (ir, grid[-1], rets)
     choice = {k: best[1][k] for k in ["d", "lam_tc", "lam_beta", "short_me_q"]} | {"val_ir": best[0]}

@@ -219,7 +219,7 @@ def _pipe_tune(frames, feats, market, cfg):
         rets, _ = book_returns(w, frames[d], market, cfg)
         ir = _pipe_ir(rets)
         grid.append({"d": d, "lam_tc": ltc, "lam_beta": lb, "short_me_q": q, "val_ir": ir,
-                     "n_relaxed_months": sum(1 for r in log if r.get("beta_tol", 0) > cfg["beta_tol"] + 1e-12)})
+                     "n_relaxed_months": sum(1 for r in log if (r.get("beta_tol") or 0) > cfg["beta_tol"] + 1e-12)})
         if np.isfinite(ir) and (best is None or ir > best[0]):
             best = (ir, grid[-1], rets)
     choice = {k: best[1][k] for k in ["d", "lam_tc", "lam_beta", "short_me_q"]} | {"val_ir": best[0]}
