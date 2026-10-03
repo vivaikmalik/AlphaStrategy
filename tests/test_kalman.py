@@ -1,12 +1,13 @@
 import polars as pl
 import numpy as np
+from datetime import date
 from src.kalman import run_kalman_filter
 
 def test_kalman():
     print("Running Kalman Filter Test...")
     df = pl.DataFrame({
         "permno": [1, 1, 1],
-        "eom": [pl.date(2015, 1, 31), pl.date(2015, 2, 28), pl.date(2015, 3, 31)],
+        "eom": [date(2015, 1, 31), date(2015, 2, 28), date(2015, 3, 31)],
         "sector": [10, 10, 10],
         "beta_dimson_21d": [1.1, np.nan, 1.3],
         "betadown_252d": [1.05, 1.15, np.nan],
