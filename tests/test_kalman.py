@@ -1,26 +1,55 @@
-import polars as pl
+"""Kalman step 8 on simulated data: MLE recovers phi/q/R, missing months handled, fallbacks."""
 import numpy as np
-from datetime import date
-from src.kalman import run_kalman_filter
+import polars as pl
+from src.config import CONFIG
+from src.kalman import kalman_betas
 
-def test_kalman():
-    print("Running Kalman Filter Test...")
-    df = pl.DataFrame({
-        "permno": [1, 1, 1],
-        "eom": [date(2015, 1, 31), date(2015, 2, 28), date(2015, 3, 31)],
-        "sector": [10, 10, 10],
-        "beta_dimson_21d": [1.1, np.nan, 1.3],
-        "betadown_252d": [1.05, 1.15, np.nan],
-        "betabab_1260d": [1.2, 1.2, 1.2],
-        "beta_60m": [1.15, 1.1, 1.2]
-    })
-    
-    df_filtered = run_kalman_filter(df)
-    
-    assert "beta_kf" in df_filtered.columns, "Missing state estimate"
-    assert "beta_var" in df_filtered.columns, "Missing variance estimate"
-    assert df_filtered["beta_kf"].is_null().sum() == 0, "Kalman filter left NaNs"
-    print("✅ Kalman Filter (Step 8) Verified.")
+CFG = dict(CONFIG)
+OBS = CFG["kalman_obs"]
+TRUE_R = [0.08, 0.05, 0.03, 0.02]
 
-if __name__ == "__main__":
-    test_kalman()
+
+def _sim(n=300, T=72, phi=0.9, q=0.02, seed=0, p_miss=0.1):
+    rng = np.random.default_rng(seed)
+    months = pl.date_range(pl.date(2015, 1, 31), pl.date(2020, 12, 31), "1mo", eager=True).dt.month_end()[:T]
+    sec = rng.integers(10, 14, n)
+    m = np.ones((n, T)) * (0.8 + 0.1 * (sec % 4))[:, None]
+    d = rng.normal(0, np.sqrt(q / (1 - phi ** 2)), n)
+    rows = []
+    beta = np.zeros((n, T))
+    for t in range(T):
+        d = phi * d + rng.normal(0, np.sqrt(q), n) if t else d
+        beta[:, t] = m[:, t] + d
+    for i in range(n):
+        for t in range(T):
+            if rng.random() < p_miss:
+                continue                                                    # missing stock-month
+            obs = [beta[i, t] + rng.normal(0, np.sqrt(r)) if rng.random() > 0.15 else None for r in TRUE_R]
+            rows.append((1000 + i, months[t], f"{sec[i]}101010", *obs))
+    df = pl.DataFrame(rows, schema=["permno", "eom", "gics", *OBS], orient="row")
+    return df.with_columns(pl.col("permno").cast(pl.Int64)), beta
+
+
+def test_mle_recovers_params_and_shapes():
+    df, beta = _sim()
+    out, p = kalman_betas(df, CFG)
+    assert out.height == df.height and out.select("permno", "eom").equals(df.select("permno", "eom"))
+    assert abs(p["phi"] - 0.9) < 0.07 and abs(p["q"] - 0.02) < 0.01
+    for r, c in zip(TRUE_R, OBS):
+        assert 0.4 * r < p["R"][c] < 2.5 * r, (c, p["R"][c])
+    assert out["beta_kf"].null_count() == 0 and out["beta_var"].min() > 0
+
+
+def test_missing_months_widen_variance_and_fallback():
+    df, _ = _sim(n=40, T=40, p_miss=0.0)
+    pid = df["permno"].min()
+    gap = df.filter(~((pl.col("permno") == pid) & (pl.col("eom").is_between(pl.date(2016, 1, 31), pl.date(2016, 6, 30)))))
+    full, _ = kalman_betas(df, CFG)
+    holed, _ = kalman_betas(gap, CFG)
+    a = full.filter((pl.col("permno") == pid) & (pl.col("eom") == pl.date(2016, 7, 31)))["beta_var"][0]
+    b = holed.filter((pl.col("permno") == pid) & (pl.col("eom") == pl.date(2016, 7, 31)))["beta_var"][0]
+    assert b >= a - 1e-12
+    # a stock with no observations at all falls back to the sector median (m_t)
+    blank = df.filter(pl.col("permno") == pid).with_columns([pl.lit(None, pl.Float64).alias(c) for c in OBS])
+    out, _ = kalman_betas(pl.concat([df.filter(pl.col("permno") != pid), blank]), CFG)
+    assert out.filter(pl.col("permno") == pid)["beta_kf"].null_count() == 0

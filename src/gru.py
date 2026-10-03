@@ -1,198 +1,107 @@
 """
-src/gru.py - Step 4: Unsupervised GRU Autoencoder
-Extracts 11-month sequence changes, trains the bottleneck on pre-2019 data using AdamW, 
-and generates latent embeddings.
+src/gru.py - Step 4: GRU autoencoder on 11 month-to-month changes of ranked features (trained <= 2018-11, then frozen).
 """
-
-import polars as pl
+import copy
 import numpy as np
+import polars as pl
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from src.config import DATA_DIR, CACHE_DIR
 
-class SequenceGRUAutoencoder(nn.Module):
-    def __init__(self, input_dim=147, hidden_dim=64, latent_dim=16):
+
+class _GruAE(nn.Module):
+    """1-layer GRU encoder (hidden 64) -> linear to d; GRU decoder reconstructs the sequence from z."""
+    def __init__(self, n_feat, d, hidden, seq):
         super().__init__()
-        # Encoder: 1-layer GRU to 64 hidden, then linear to latent d
-        self.encoder_gru = nn.GRU(input_dim, hidden_dim, num_layers=1, batch_first=True)
-        self.encoder_linear = nn.Linear(hidden_dim, latent_dim)
-        
-        # Decoder: GRU reconstructs sequence from the latent vector
-        self.decoder_gru = nn.GRU(latent_dim, hidden_dim, num_layers=1, batch_first=True)
-        self.decoder_linear = nn.Linear(hidden_dim, input_dim)
-        
+        self.seq = seq
+        self.enc, self.to_z = nn.GRU(n_feat, hidden, batch_first=True), nn.Linear(hidden, d)
+        self.dec, self.out = nn.GRU(d, hidden, batch_first=True), nn.Linear(hidden, n_feat)
+
+    def encode(self, x):
+        return self.to_z(self.enc(x)[1][0])
+
     def forward(self, x):
-        # x shape: (batch, 11, 147)
-        _, hidden = self.encoder_gru(x)
-        z = self.encoder_linear(hidden.squeeze(0))  # Latent embedding 'd'
-        
-        # Repeat embedding across the 11-month sequence length for the decoder
-        seq_len = x.size(1)
-        z_repeated = z.unsqueeze(1).repeat(1, seq_len, 1)
-        
-        dec_out, _ = self.decoder_gru(z_repeated)
-        reconstruction = self.decoder_linear(dec_out)
-        
-        return reconstruction, z
+        z = self.encode(x)
+        return self.out(self.dec(z[:, None, :].expand(-1, self.seq, -1))[0]), z
 
-def build_sequences(df: pl.DataFrame, factors: list) -> pl.DataFrame:
-    """
-    Computes 11 month-to-month changes over t-11..t and extracts sequences.
-    Requires at least 6 valid months; otherwise, marked as invalid.
-    """
-    # Sort chronologically per stock
+
+def _gru_windows(df, factors, seq):
+    """Dense (permno, month, feat) changes D and validity V; row indices (p, m) and valid-change counts per row."""
+    mi = (df["eom"].dt.year() * 12 + df["eom"].dt.month() - 1).to_numpy().astype(np.int64)
+    m = mi - (mi.min() - seq)  # pad so every window exists
+    p_ids, p = np.unique(df["permno"].to_numpy(), return_inverse=True)
+    X = np.full((len(p_ids), m.max() + 1, len(factors)), np.nan, np.float32)
+    X[p, m] = df.select(factors).to_numpy().astype(np.float32)
+    pres = ~np.isnan(X[:, :, 0])
+    V = np.zeros(pres.shape, bool)
+    V[:, 1:] = pres[:, 1:] & pres[:, :-1]  # change valid only between calendar-consecutive present months
+    D = np.zeros_like(X)
+    D[:, 1:] = np.where(V[:, 1:, None], X[:, 1:] - X[:, :-1], 0.0)
+    nvalid = V[p[:, None], m[:, None] + np.arange(-seq + 1, 1)].sum(1)
+    return D, V, p, m, nvalid
+
+
+def _gru_batch(D, V, p, m, seq, dev):
+    ix = m[:, None] + np.arange(-seq + 1, 1)
+    return (torch.from_numpy(D[p[:, None], ix]).to(dev),
+            torch.from_numpy(V[p[:, None], ix]).to(dev).float().unsqueeze(-1))
+
+
+def _gru_loss(model, x, mask):
+    xh, _ = model(x)
+    return (mask * (xh - x) ** 2).sum() / (mask.sum() * x.shape[-1]).clamp(min=1)  # masked MSE
+
+
+def gru_embeddings(df, factors, d, cfg):
+    """Train on eom <= 2018-11, early-stop on 2019-2020 loss, pick weight decay, embed all (permno, eom)."""
+    seq, dev, bs = cfg["gru_seq_len"], cfg["device"], cfg["gru_batch"]
     df = df.sort(["permno", "eom"])
-    
-    # Calculate month-to-month changes
-    diff_exprs = [pl.col(f).diff().alias(f"{f}_diff") for f in factors]
-    df = df.with_columns(diff_exprs)
-    
-    diff_cols = [f"{f}_diff" for f in factors]
-    
-    # Fast rolling sequence extraction using Pandas/NumPy
-    # Polars rolling over multiple columns is currently limited, so we bridge to NumPy
-    pdf = df.select(["permno", "eom"] + diff_cols).to_pandas()
-    
-    sequences = []
-    valid_masks = []
-    
-    for _, group in pdf.groupby("permno"):
-        vals = group[diff_cols].values
-        eoms = group["eom"].values
-        
-        # Need at least 11 rows to form one complete t-11..t window
-        if len(vals) < 11:
-            seqs = np.zeros((len(vals), 11, len(factors)))
-            valid = np.zeros(len(vals), dtype=bool)
-        else:
-            # Create sliding windows of shape (N-10, 11, 147)
-            window_view = np.lib.stride_tricks.sliding_window_view(vals, window_shape=(11, len(factors)))
-            window_view = window_view.squeeze(1) # Drop dummy dimension
-            
-            # Pad the first 10 rows with zeros (invalid)
-            pad = np.zeros((10, 11, len(factors)))
-            seqs = np.concatenate([pad, window_view], axis=0)
-            
-            # Require at least 6 valid months (non-NaN rows per sequence)
-            # A row is valid if it doesn't contain NaNs (or checking all features)
-            valid_counts = (~np.isnan(seqs).any(axis=2)).sum(axis=1)
-            valid = valid_counts >= 6
-            
-        sequences.extend(seqs)
-        valid_masks.extend(valid)
-        
-    df = df.with_columns([
-        pl.Series("sequence_valid", valid_masks)
-    ])
-    
-    # Convert sequence list to a stacked NumPy array for PyTorch
-    stacked_seqs = np.stack(sequences)
-    
-    # Replace any remaining NaNs in valid sequences with 0 for the PyTorch MSE
-    stacked_seqs = np.nan_to_num(stacked_seqs, nan=0.0)
-    
-    return df, stacked_seqs
-
-
-def train_and_embed(d: int, df: pl.DataFrame, factors: list, device="cuda"):
-    """
-    Trains the GRU Autoencoder and returns the embeddings.
-    Weight decay is tuned dynamically based on 2019-2020 validation loss.
-    """
-    df, seq_array = build_sequences(df, factors)
-    
-    # Define splits
-    train_mask = (df["eom"] <= pl.date(2018, 11, 30)) & df["sequence_valid"]
-    val_mask = (df["eom"] >= pl.date(2019, 1, 1)) & (df["eom"] <= pl.date(2020, 12, 31)) & df["sequence_valid"]
-    
-    train_idx = df.filter(train_mask).select(pl.arange(0, len(df))).to_series().to_list()
-    val_idx = df.filter(val_mask).select(pl.arange(0, len(df))).to_series().to_list()
-    
-    X_train = torch.tensor(seq_array[train_idx], dtype=torch.float32)
-    X_val = torch.tensor(seq_array[val_idx], dtype=torch.float32)
-    
-    train_loader = DataLoader(TensorDataset(X_train), batch_size=256, shuffle=True)
-    val_loader = DataLoader(TensorDataset(X_val), batch_size=256, shuffle=False)
-    
-    best_overall_val_loss = float('inf')
-    best_model_state = None
-    best_wd = 0
-    
-    # Grid search weight decay by 2019-2020 reconstruction loss
-    for wd in [0, 1e-4, 1e-3]:
-        model = SequenceGRUAutoencoder(input_dim=147, hidden_dim=64, latent_dim=d).to(device)
-        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=wd)
-        criterion = nn.MSELoss()
-        
-        patience, best_val_loss = 5, float('inf')
-        epochs_no_improve = 0
-        
-        for epoch in range(100):
+    D, V, p, m, nvalid = _gru_windows(df, factors, seq)
+    ok = nvalid >= cfg["gru_min_valid"]
+    eom = df["eom"]
+    tr_end = pl.Series([cfg["gru_train_end_eom"]]).str.to_date()[0]
+    v0, v1 = [pl.Series([s]).str.to_date()[0] for s in cfg["gru_val_eom"]]
+    tr = np.where(ok & (eom <= tr_end).to_numpy())[0]
+    va = np.where(ok & ((eom >= v0) & (eom <= v1)).to_numpy())[0]
+    if len(va) == 0:
+        va = tr
+    wd_losses, best = {}, None
+    for wd in cfg["gru_wd_grid"]:
+        torch.manual_seed(cfg["seed"])
+        rng = np.random.default_rng(cfg["seed"])
+        model = _GruAE(len(factors), d, cfg["gru_hidden"], seq).to(dev)
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg["gru_lr"], weight_decay=wd)
+        best_l, best_sd, bad = np.inf, None, 0
+        for _ in range(cfg["gru_max_epochs"]):
             model.train()
-            for batch in train_loader:
-                x = batch[0].to(device)
-                optimizer.zero_grad()
-                recon, _ = model(x)
-                loss = criterion(recon, x)
-                loss.backward()
-                
-                # Clip gradient norm at 1.0 on every step
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                
-            # Validation Step
+            perm = rng.permutation(tr)
+            for i in range(0, len(perm), bs):
+                b = perm[i:i + bs]
+                x, mk = _gru_batch(D, V, p[b], m[b], seq, dev)
+                opt.zero_grad()
+                _gru_loss(model, x, mk).backward()
+                nn.utils.clip_grad_norm_(model.parameters(), cfg["gru_clip"])
+                opt.step()
             model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    x = batch[0].to(device)
-                    recon, _ = model(x)
-                    val_loss += criterion(recon, x).item()
-                    
-            val_loss /= len(val_loader)
-            print(f"WD: {wd} | Epoch: {epoch} | Val MSE: {val_loss:.4f}")
-            
-            # Early stopping on 2019-2020 reconstruction loss
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                epochs_no_improve = 0
-                if val_loss < best_overall_val_loss:
-                    best_overall_val_loss = val_loss
-                    best_model_state = model.state_dict()
-                    best_wd = wd
+            with torch.no_grad():  # val loss: mean masked MSE over batches, weighted by batch size
+                tot = sum(_gru_loss(model, *_gru_batch(D, V, p[va[i:i + bs]], m[va[i:i + bs]], seq, dev)).item()
+                          * len(va[i:i + bs]) for i in range(0, len(va), bs)) / len(va)
+            if tot < best_l - 1e-9:
+                best_l, best_sd, bad = tot, copy.deepcopy(model.state_dict()), 0
             else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
+                bad += 1
+                if bad >= cfg["gru_patience"]:
                     break
-                    
-    print(f"GRU (d={d}) selected weight_decay={best_wd} with Val MSE: {best_overall_val_loss:.4f}")
-    
-    # Generate final embeddings for the entire dataset
-    final_model = SequenceGRUAutoencoder(input_dim=147, hidden_dim=64, latent_dim=d).to(device)
-    final_model.load_state_dict(best_model_state)
-    final_model.eval()
-    
-    all_loader = DataLoader(TensorDataset(torch.tensor(seq_array, dtype=torch.float32)), batch_size=512, shuffle=False)
-    
-    embeddings = []
+        wd_losses[wd] = best_l
+        if best is None or best_l < best[0]:
+            best = (best_l, wd, best_sd)
+    model = _GruAE(len(factors), d, cfg["gru_hidden"], seq).to(dev)
+    model.load_state_dict(best[2])
+    model.eval()
+    emb = np.full((len(df), d), np.nan, np.float32)
+    idx = np.where(ok)[0]
     with torch.no_grad():
-        for batch in all_loader:
-            x = batch[0].to(device)
-            _, z = final_model(x)
-            embeddings.append(z.cpu().numpy())
-            
-    embeddings = np.concatenate(embeddings, axis=0)
-    
-    # Nullify embeddings that didn't meet the 6-month validity rule
-    invalid_mask = ~df["sequence_valid"].to_numpy()
-    embeddings[invalid_mask] = np.nan
-    
-    # Append gru_1..gru_d to DataFrame
-    gru_cols = [f"gru_{i+1}" for i in range(d)]
-    df_out = df.select(["permno", "eom"])
-    for i, col in enumerate(gru_cols):
-        df_out = df_out.with_columns(pl.Series(col, embeddings[:, i]))
-        
-    return df_out
+        for i in range(0, len(idx), bs):
+            b = idx[i:i + bs]
+            emb[b] = model.encode(_gru_batch(D, V, p[b], m[b], seq, dev)[0]).cpu().numpy()
+    out = df.select("permno", "eom").with_columns([pl.Series(f"gru_{j + 1}", emb[:, j]) for j in range(d)])
+    return out, {"d": d, "best_wd": best[1], "val_loss": best[0], "wd_losses": wd_losses}

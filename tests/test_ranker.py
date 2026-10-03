@@ -1,148 +1,106 @@
-"""
-src/ranker.py - Step 5: XGBoost Ranker (Production Spec)
-"""
-import polars as pl
-import xgboost as xgb
+"""Fast synthetic tests for src/ranker.py (no real data)."""
+import calendar
+from datetime import date
+
 import numpy as np
-from scipy.stats import spearmanr
-from sklearn.linear_model import LinearRegression
+import polars as pl
+import pytest
 
-def compute_rank_ic(model, X_val, df_val):
-    """Evaluates validation mean monthly rank IC[cite: 2]."""
-    preds = model.predict(X_val)
-    # XGBRanker output doesn't have a fixed scale, we rank it cross-sectionally
-    df_temp = df_val.with_columns(pl.Series("score", preds))
-    
-    # Calculate Spearman rank correlation (IC) per month
-    ic_list = []
-    for eom, group in df_temp.group_by("eom"):
-        ic, _ = spearmanr(group["score"], group["ret_exc_lead1m"])
-        if not np.isnan(ic):
-            ic_list.append(ic)
-            
-    return np.mean(ic_list)
+from src.config import CONFIG
+from src.ranker import _rk_labels, fit_predict_year, rank_ic, run_schedule, windows
 
-def train_and_rank(df: pl.DataFrame, features: list, target_col: str = "ret_exc_lead1m"):
-    """
-    Trains pairwise XGBRanker using exact hackathon specifications[cite: 2].
-    """
-    # 1. Label Assignment: Within-month decile (0-9)[cite: 2]
-    df = df.drop_nulls(subset=[target_col] + features)
-    df = df.with_columns(
-        (pl.col(target_col).rank("ordinal").over("eom") / pl.col(target_col).count().over("eom") * 10)
-        .floor().clip(0, 9).cast(pl.Int32).alias("label_decile")
-    )
-    
-    # Sort rows by eom (required for pairwise ranking query groups)[cite: 2]
-    df = df.sort("eom")
-    
-    # Chronological Splits
-    train_mask = df["eom"] <= pl.date(2018, 11, 30)
-    val_mask = (df["eom"] >= pl.date(2019, 1, 1)) & (df["eom"] <= pl.date(2020, 12, 31))
-    
-    train_df = df.filter(train_mask)
-    val_df = df.filter(val_mask)
-    
-    # Extract arrays
-    X_train = train_df.select(features).to_pandas()
-    y_train = train_df["label_decile"].to_numpy()
-    qid_train = train_df["eom"].dt.epoch().to_numpy() # Grouping IDs for ranking[cite: 2]
-    
-    X_val = val_df.select(features).to_pandas()
-    y_val = val_df["label_decile"].to_numpy()
-    qid_val = val_df["eom"].dt.epoch().to_numpy()
-    
-    # 2. Grid Search[cite: 2]
-    best_ic = -float('inf')
-    best_params = {}
-    best_trees = 0
-    best_model_val = None
-    
-    print("Executing hyperparameter grid search on max_depth [3, 4, 5]...")
-    for depth in [3, 4, 5]:
-        # Fixed settings from spec[cite: 2]
-        model = xgb.XGBRanker(
-            objective="rank:pairwise",
-            learning_rate=0.03,
-            subsample=0.7,
-            colsample_bytree=0.5,
-            min_child_weight=200,
-            reg_lambda=10,
-            tree_method="hist",
-            device="cuda",
-            max_depth=depth,
-            n_estimators=2000,
-            early_stopping_rounds=50,
-            eval_metric="ndcg"
-        )
-        
-        # Fit with evaluation every 50 trees
-        model.fit(
-            X_train, y_train, qid=qid_train,
-            eval_set=[(X_val, y_val)], eval_qid=[qid_val],
-            verbose=False
-        )
-        
-        current_ic = compute_rank_ic(model, X_val, val_df)
-        print(f"Depth {depth} -> Trees: {model.best_iteration + 1} | Val IC: {current_ic:.4f}")
-        
-        if current_ic > best_ic:
-            best_ic = current_ic
-            best_params = {"max_depth": depth}
-            best_trees = model.best_iteration + 1
-            best_model_val = model
+CFG = {**CONFIG, "device": "cpu", "xgb_max_trees": 100, "xgb_depth_grid": [3, 4], "test_years": [2021],
+       "xgb_fixed": {**CONFIG["xgb_fixed"], "min_child_weight": 1, "learning_rate": 0.1}}
+FEATS = ["f0", "f1", "f2", "f3"]
 
-    print(f"Optimal XGBoost Params: Depth {best_params['max_depth']}, Trees {best_trees}")
-    
-    # 3. Return Forecast Regression (for OOS R²)[cite: 2]
-    val_preds = best_model_val.predict(X_val)
-    val_df_pred = val_df.with_columns(pl.Series("raw_score", val_preds))
-    
-    # Rank and scale to [-1, 1][cite: 2]
-    val_df_pred = val_df_pred.with_columns(
-        ((pl.col("raw_score").rank("dense").over("eom") - 1) / 
-         (pl.col("raw_score").count().over("eom") - 1) * 2 - 1).alias("scaled_rank")
-    )
-    
-    # Fit linear regression on validation years[cite: 2]
-    lr = LinearRegression()
-    lr.fit(val_df_pred["scaled_rank"].to_numpy().reshape(-1, 1), val_df_pred[target_col].to_numpy())
-    
-    # 4. Refit on Train + Validation[cite: 2]
-    print("Refitting optimal model on combined Train + Validation data...")
-    X_train_val = df.filter(train_mask | val_mask).select(features).to_pandas()
-    y_train_val = df.filter(train_mask | val_mask)["label_decile"].to_numpy()
-    qid_train_val = df.filter(train_mask | val_mask)["eom"].dt.epoch().to_numpy()
-    
-    final_model = xgb.XGBRanker(
-        objective="rank:pairwise",
-        learning_rate=0.03,
-        subsample=0.7,
-        colsample_bytree=0.5,
-        min_child_weight=200,
-        reg_lambda=10,
-        tree_method="hist",
-        device="cuda",
-        max_depth=best_params["max_depth"],
-        n_estimators=best_trees
-    )
-    
-    final_model.fit(X_train_val, y_train_val, qid=qid_train_val, verbose=False)
-    
-    # 5. Predict Test Year and Generate final signals
-    print("Scoring universe and applying return forecast...")
-    X_all = df.select(features).to_pandas()
-    df = df.with_columns(pl.Series("score", final_model.predict(X_all)))
-    
-    df = df.with_columns(
-        ((pl.col("score").rank("dense").over("eom") - 1) / 
-         (pl.col("score").count().over("eom") - 1) * 2 - 1).alias("scaled_test_rank")
-    )
-    
-    # Apply forecast regression to get ret_hat[cite: 2]
-    df = df.with_columns(
-        pl.Series("ret_hat", lr.predict(df["scaled_test_rank"].to_numpy().reshape(-1, 1)))
-    )
-    
-    # The optimizer requires the column to be exactly 'score'
-    return df, final_model
+
+def _me(y, m):
+    return date(y, m, calendar.monthrange(y, m)[1])
+
+
+def _panel(signal=1.0, n=60, seed=0, last=(2021, 12)):
+    """target months 2015-02..last; eom = target month - 1; planted signal in f0; last test month has null target."""
+    rng = np.random.default_rng(seed)
+    tms = [(y, m) for y in range(2015, 2022) for m in range(1, 13) if (2015, 2) <= (y, m) <= last]
+    rows = []
+    for y, m in tms:
+        f = rng.normal(size=(n, 4))
+        r = signal * 0.05 * f[:, 0] + 0.05 * rng.normal(size=n)
+        e = _me(y - 1, 12) if m == 1 else _me(y, m - 1)
+        rows.append(pl.DataFrame({"permno": np.arange(n), "eom": [e] * n, "target_month": [_me(y, m)] * n,
+                                  "ret_exc_lead1m": r, **{k: f[:, i] for i, k in enumerate(FEATS)}}))
+    df = pl.concat(rows)
+    return df.with_columns(pl.when(pl.col("target_month") == _me(*last)).then(None).otherwise(pl.col("ret_exc_lead1m"))
+                           .alias("ret_exc_lead1m"))
+
+
+def _join(pred, df):
+    return pred.join(df.select("permno", "eom", "ret_exc_lead1m"), on=["permno", "eom"])
+
+
+def test_windows_match_schedule():
+    ws = {w["year"]: w for w in windows({**CONFIG, "test_years": [2021, 2026]})}
+    assert ws[2021]["train"] == (date(2015, 2, 28), date(2018, 12, 31))
+    assert ws[2021]["val"] == (date(2019, 1, 31), date(2020, 12, 31))
+    assert ws[2021]["test"] == (date(2021, 1, 31), date(2021, 12, 31))
+    assert ws[2026]["train"] == (date(2015, 2, 28), date(2023, 12, 31))
+    assert ws[2026]["val"] == (date(2024, 1, 31), date(2025, 12, 31))
+    assert ws[2026]["test"] == (date(2026, 1, 31), date(2026, 8, 31))
+
+
+def test_labels_are_month_deciles():
+    df = _panel().sort("eom")
+    lab = _rk_labels(df["eom"], df["ret_exc_lead1m"].fill_null(0.0))
+    d = df.with_columns(l=pl.Series(lab))
+    assert set(lab) == set(range(10))
+    assert d.group_by("eom").agg(pl.col("l").min().alias("a"), pl.col("l").max().alias("b")).filter(
+        (pl.col("a") != 0) | (pl.col("b") != 9)).is_empty()
+    one = d.filter(pl.col("eom") == d["eom"][0]).sort("ret_exc_lead1m")["l"].to_list()
+    assert one == sorted(one)
+
+
+@pytest.fixture(scope="module")
+def planted():
+    df = _panel()
+    return df, fit_predict_year(df, FEATS, windows(CFG)[0], CFG)
+
+
+def test_signal_gives_positive_ic_and_trees_multiple_of_50(planted):
+    df, (te, va, info) = planted
+    assert info["val_ic"] > 0.2 and info["best_trees"] % 50 == 0 and info["best_depth"] in (3, 4)
+    assert rank_ic(_join(te, df))["ic"].mean() > 0.2
+    assert set(te.columns) == {"permno", "eom", "score", "ret_hat"}
+
+
+def test_ret_hat_from_val_scores_and_null_target_rows_predicted(planted):
+    df, (te, va, info) = planted
+    assert te["eom"].max() == _me(2021, 11)  # target month 2021-12 has null target but is still scored
+    assert te["score"].null_count() == 0 and te["ret_hat"].null_count() == 0
+    # ret_hat is an affine function of the within-month score rank, with the slope fitted on val -> positive here
+    t = te.with_columns(r=pl.col("score").rank().over("eom"))
+    assert t.group_by("eom").agg(pl.corr("r", "ret_hat").alias("c"))["c"].min() > 0.99
+    assert _join(va, df).drop_nulls()["ret_hat"].std() > 0 and va["eom"].min() >= _me(2018, 12)
+
+
+def test_shuffle_gives_zero_ic(planted):
+    df, _ = planted
+    te, _, _ = fit_predict_year(df, FEATS, windows(CFG)[0], CFG, shuffle=True)
+    ic0 = rank_ic(_join(planted[1][0], df))["ic"].mean()
+    assert abs(rank_ic(_join(te, df))["ic"].mean()) < min(0.2, ic0 / 2)  # noise level (11 test months, sd ~0.05-0.1)
+
+
+def test_ridge_path_and_run_schedule():
+    df = _panel()
+    te, va, infos = run_schedule(df, FEATS, {**CFG, "ridge_alpha_grid": [1, 100]}, model="ridge")
+    assert infos[0]["model"] == "ridge" and infos[0]["best_alpha"] in (1, 100) and infos[0]["val_ic"] > 0.2
+    assert rank_ic(_join(te, df))["ic"].mean() > 0.2 and va["eom"].min() >= _me(2018, 12)
+
+
+def test_val_pred_includes_null_target_rows():
+    df = _panel()
+    w = windows(CFG)[0]
+    df = df.with_columns(pl.when((pl.col("target_month") == w["val"][1]) & (pl.col("permno") < 10)).then(None)
+                         .otherwise(pl.col("ret_exc_lead1m")).alias("ret_exc_lead1m"))
+    _, va, _ = fit_predict_year(df, FEATS, w, CFG)
+    n = df.filter((pl.col("target_month") >= w["val"][0]) & (pl.col("target_month") <= w["val"][1])).height
+    assert va.height == n and va["ret_hat"].null_count() == 0 and va["score"].null_count() == 0
