@@ -152,6 +152,7 @@ def train_and_embed(d: int, df: pl.DataFrame, factors: list, device="cuda"):
                     val_loss += criterion(recon, x).item()
                     
             val_loss /= len(val_loader)
+            print(f"WD: {wd} | Epoch: {epoch} | Val MSE: {val_loss:.4f}")
             
             # Early stopping on 2019-2020 reconstruction loss
             if val_loss < best_val_loss:
