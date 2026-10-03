@@ -1,11 +1,12 @@
 import polars as pl
+from datetime import date
 from src.text import process_text_features
 
 def test_text():
     print("Running Text & FinBERT Test...")
     df_8k = pl.DataFrame({
         "permno": [10001, 10001],
-        "eom": [pl.date(2020, 1, 31), pl.date(2020, 2, 29)],
+        "eom": [date(2020, 1, 31), date(2020, 2, 29)],
         "document_id": ["d1", "d2"],
         "text_sha256": ["hash1", "hash2"],
         "items": ["Item 1.01, Item 4.02", "Item 8.01"],
