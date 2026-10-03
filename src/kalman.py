@@ -4,8 +4,14 @@ import numpy as np
 def run_kalman_filter(df: pl.DataFrame) -> pl.DataFrame:
     """Calculates state-space beta and variance per stock-month[cite: 2]."""
     obs_cols = ["beta_dimson_21d", "betadown_252d", "betabab_1260d", "beta_60m"]
-    df = df.with_columns(pl.col("beta_60m").median().over(["sector", "eom"]).fill_null(pl.col("beta_60m").median().over("eom")).alias("m_t"))
-    df = df.sort(["permno", "eom"])
+    
+    # Unpacked over() without lists
+    df = df.with_columns(
+        pl.col("beta_60m").median().over("sector", "eom")
+        .fill_null(pl.col("beta_60m").median().over("eom"))
+        .alias("m_t")
+    )
+    df = df.sort("permno", "eom")
     
     phi, q = 0.95, 0.02
     R = {"beta_dimson_21d": 0.05, "betadown_252d": 0.04, "betabab_1260d": 0.03, "beta_60m": 0.02}
@@ -37,4 +43,7 @@ def run_kalman_filter(df: pl.DataFrame) -> pl.DataFrame:
         else:
             beta_kf[i], beta_var[i] = state_est, cov_est
 
-    return df.with_columns([pl.Series("beta_kf", beta_kf), pl.Series("beta_var", beta_var)]).drop("m_t")
+    return df.with_columns(
+        pl.Series("beta_kf", beta_kf), 
+        pl.Series("beta_var", beta_var)
+    ).drop("m_t")
