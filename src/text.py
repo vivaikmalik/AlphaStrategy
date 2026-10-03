@@ -4,17 +4,19 @@ import re
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 def process_text_features(df_8k: pl.DataFrame, device: str = "cuda") -> pl.DataFrame:
-    """Extracts 8-K event flags and FinBERT tone per stock-month."""
+    """Extracts 8-K event flags and FinBERT tone per stock-month[cite: 2]."""
     items_to_flag = ["1.01", "1.02", "1.03", "2.01", "2.02", "2.03", "2.05", "2.06", 
                      "3.01", "4.01", "4.02", "5.02", "7.01", "8.01"]
     history_items = ["4.02", "5.02", "2.06", "1.02", "2.05"]
     
     # 1. Deduplicate and assign to filing month[cite: 2]
     df = df_8k.unique(subset=["permno", "text_sha256"]).drop_nulls("text")
-    df = df.with_columns([
+    
+    # Unpacked with_columns and over (NO LIST BRACKETS)
+    df = df.with_columns(
         pl.lit(1).alias("has_filing"),
-        pl.col("document_id").count().over(["permno", "eom"]).alias("n_filings")
-    ])
+        pl.col("document_id").len().over("permno", "eom").alias("n_filings")
+    )
     
     for item in items_to_flag:
         df = df.with_columns(
@@ -61,15 +63,19 @@ def process_text_features(df_8k: pl.DataFrame, device: str = "cuda") -> pl.DataF
     for item in items_to_flag:
         agg_exprs.append(pl.col(f"item_{item.replace('.', '_')}").max())
         
-    df_monthly = df.group_by(["permno", "eom"]).agg(agg_exprs).sort(["permno", "eom"])
+    # Unpacked agg using *agg_exprs
+    df_monthly = df.group_by("permno", "eom").agg(*agg_exprs).sort("permno", "eom")
     
     for item in history_items:
         df_monthly = df_monthly.with_columns(
             pl.col(f"item_{item.replace('.', '_')}").rolling_sum(window_size=12, min_periods=1).over("permno").alias(f"item_{item.replace('.', '_')}_12m")
         )
         
-    df_monthly = df_monthly.with_columns([
+    # Unpacked with_columns chaining
+    df_monthly = df_monthly.with_columns(
         pl.col("tone_mean").rolling_mean(window_size=12, min_periods=1).over("permno").alias("tone_12m_avg")
-    ]).with_columns((pl.col("tone_mean") - pl.col("tone_12m_avg")).alias("tone_surprise")).drop("tone_12m_avg")
+    ).with_columns(
+        (pl.col("tone_mean") - pl.col("tone_12m_avg")).alias("tone_surprise")
+    ).drop("tone_12m_avg")
     
     return df_monthly
