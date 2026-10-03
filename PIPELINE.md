@@ -214,6 +214,7 @@ Is there an LLM agent reading the 8-Ks? No. The pipeline uses only item-code fla
 Each item below was checked in the code.
 
 1. `lambdarank_normalization=False` (`config.py`). With the xgboost 2.x default, pairwise gradients are normalised so the hessians become too small for `min_child_weight=200` to allow any split, and every depth gives the same model. The flag restores the classic behaviour. The spec lists no such setting.
+1b. `lambdarank_pair_method="mean"` (`config.py`). xgboost 2.x defaults to `"topk"`, which builds pairs only among the top-ranked stocks of each month, so the model never learns the order of the rest of the cross-section. On synthetic data it reached a rank IC of 0.006 against 0.021 for `"mean"` (classic pairwise over all stocks). The first full run used the default: XGBoost test IC was negative, every variant lost to Ridge, and most windows stopped at 50 trees.
 2. Kalman winsorising (`kalman.py`). The four raw betas are clipped at the 1st/99th percentile of the fit sample (`eom <= 2018-12`) before filtering, because raw values reach +/-1e4. Marked "not in spec" in the code.
 3. Ticker anonymisation is case-sensitive; the spec says case-insensitive for both name and ticker. Names are case-insensitive. The reason is in section 6.
 4. Short-eligible ME percentile is a fourth dimension of the step-10 grid (0.30/0.40/0.50). The spec says only "the universe thresholds" are tunable; the code tunes this one only. `universe_me_q` (0.20), the 30th dollar-volume percentile and the zero-trades median are fixed.

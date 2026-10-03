@@ -74,7 +74,10 @@ CONFIG = {
                       colsample_bytree=0.5, min_child_weight=200, reg_lambda=10, tree_method="hist",
                       # xgboost>=2 normalises pairwise gradients by default -> hessians so small that
                       # min_child_weight=200 blocks splits (all depths identical). Classic behaviour:
-                      lambdarank_normalization=False),
+                      lambdarank_normalization=False,
+                      # xgboost>=2 defaults to "topk" pairs (only the current top-ranked docs of each month).
+                      # Classic pairwise over the whole cross-section, as the spec intends:
+                      lambdarank_pair_method="mean"),
     "xgb_depth_grid": [3, 4, 5],
     "xgb_max_trees": 100 if SMOKE else 2000,
     "xgb_eval_every": 50,
