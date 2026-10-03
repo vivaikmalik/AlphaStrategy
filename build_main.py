@@ -12,9 +12,23 @@ def build_main():
             path = os.path.join("src", module)
             if os.path.exists(path):
                 with open(path, "r") as infile:
-                    # Strip local relative imports to prevent circular dependencies in single-file format
-                    lines = [line for line in infile.readlines() if not line.startswith("from src.")]
-                    outfile.writelines(lines)
+                    inside_multiline_import = False
+                    
+                    for line in infile.readlines():
+                        # Start of a local import
+                        if line.startswith("from src."):
+                            if "(" in line and ")" not in line:
+                                inside_multiline_import = True
+                            continue
+                        
+                        # Inside a multi-line import block
+                        if inside_multiline_import:
+                            if ")" in line:
+                                inside_multiline_import = False
+                            continue
+                            
+                        # Normal lines
+                        outfile.write(line)
                     outfile.write("\n\n")
                     
         # 2. Append the actual execution engine
@@ -27,7 +41,6 @@ if __name__ == '__main__':
     print('Starting AlphaBERT End-to-End Pipeline...')
     
     # 1. Load Data (Steps 1-3)
-    # Assuming preprocessed features are saved in cache from your earlier data.py runs
     print('Loading datasets...')
     df = pl.read_parquet("cache/preprocessed_features.parquet") 
     df_8k = pl.read_parquet("data/8k_20150101_20260831_identified.parquet")
@@ -43,7 +56,6 @@ if __name__ == '__main__':
     
     # 4. XGBoost Ranker (Steps 5 & 10)
     print('Training XGBoost Ranker...')
-    # Dynamically extract all features (ignoring identifiers and target)
     exclude_cols = ["permno", "eom", "ret_exc_lead1m", "label_decile", "score", "ret_hat"]
     features = [col for col in df.columns if col not in exclude_cols]
     df_scored, final_model = train_and_rank(df, features=features, target_col="ret_exc_lead1m")
