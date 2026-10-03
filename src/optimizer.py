@@ -22,7 +22,7 @@ def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg):
     ubL = np.array([cfg["max_weight"] if p in long_ids else 0.0 for p in ids])
     ubS = np.array([cfg["max_weight"] if p in short_ids else 0.0 for p in ids])
     G = (c["sector"].to_numpy()[None, :] == np.unique(c["sector"].to_numpy())[:, None]).astype(float)
-    wp = np.array([w_prev.get(p, 0.0) for p in ids])
+    wp = np.clip(np.nan_to_num(np.array([w_prev.get(p, 0.0) for p in ids])), -cfg["max_weight"], cfg["max_weight"])
     dropped = sum(abs(v) for p, v in w_prev.items() if p not in set(ids))   # names that left the candidate set: sold to 0
 
     wL, wS = cp.Variable(n, nonneg=True), cp.Variable(n, nonneg=True)
@@ -39,7 +39,11 @@ def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg):
             prob.solve(solver=cp.CLARABEL)
         except cp.SolverError:
             return False                                                   # treated as a failed attempt
-        return prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) and w.value is not None
+        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or w.value is None:
+            return False
+        v = w.value                                                        # inaccurate solutions can hold garbage weights
+        return bool(np.all(np.isfinite(v)) and np.abs(v).max() <= cfg["max_weight"] + 1e-4
+                    and abs(np.abs(v).sum() - cfg["gross"]) <= 1e-3)
 
     t, b, no_beta = cfg["beta_tol"], cfg["sector_band"], 1e6
     if not solve(t, b):

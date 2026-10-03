@@ -92,3 +92,12 @@ def test_beta_relaxed_beyond_one_when_longs_are_high_beta():
     w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
     assert info["status"] in ("optimal", "optimal_inaccurate") and info["beta_tol"] > 1.0
     _check(m, w, info) if info["sector_band"] == CFG["sector_band"] else None
+
+
+def test_garbage_previous_weight_does_not_poison_month():
+    m = _month(n=1500, seed=6)
+    w, _ = optimize_month(m, {}, 0.0, 1000.0, CFG)
+    bad = dict(w); bad[next(iter(bad))] = 1e12
+    w2, info = optimize_month(m, bad, 0.0, 1000.0, CFG)
+    assert info["status"] in ("optimal", "optimal_inaccurate") and info["sector_band"] == CFG["sector_band"]
+    _check(m, w2, info)
