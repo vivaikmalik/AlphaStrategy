@@ -1361,11 +1361,13 @@ from pathlib import Path
 
 import polars as pl
 
+
 _AGENT_NOTE = ("explanations only; not used in portfolio construction; LLM pretraining may postdate the "
                "formation date, so explanations are post-hoc")
 _AGENT_SYSTEM = (
     "You are a buy-side analyst. Explain why the systematic model is long/short this stock at this date using "
-    "ONLY tool outputs (get_filings, get_profile, get_score). Every fact must carry a verbatim quote from a filing "
+    "ONLY tool outputs (get_filings, get_profile, get_score). The company is anonymised; do not guess its identity. "
+    " Every fact must carry a verbatim quote from a filing "
     "plus its document_id. Use no knowledge after the formation date. Reply with strict JSON: "
     '{"thesis": str, "facts": [{"fact": str, "quote": str, "document_id": str}], "risks": [str], "confidence": 0-1}.')
 _AGENT_TOOLS = [
@@ -1397,15 +1399,26 @@ def get_filings(cfg, permno, before_eom):
     a = _agent_cfg(cfg)
     d = _agent_date(before_eom)
     df = (pl.scan_parquet(cfg["data_files"]["8k"]).filter(pl.col("permno") == int(permno))
-          .select(["document_id", "permno", "filing_date", "items", "text"])
+          .select(["document_id", "permno", "filing_date", "items", "text"]
+                  + [c for c in ("company_name", "ticker") if c in pl.read_parquet_schema(cfg["data_files"]["8k"])])
           .with_columns(pl.col("filing_date").cast(pl.Date))
           .filter(pl.col("filing_date") <= d).sort("filing_date", descending=True).head(a["max_filings"]).collect())
+    # anonymise as in step 7 (firm names case-insensitive, tickers case-sensitive) so the LLM cannot recall what
+    # happened to the firm later; names from the filings and from the panel for this permno
+    names, ticks = set(), set()
+    for path in (cfg["data_files"]["8k"], cfg["data_files"]["chars"]):
+        sch = pl.read_parquet_schema(path)
+        cols = [c for c in ("company_name", "ticker") if c in sch]
+        if cols:
+            pn = pl.scan_parquet(path).filter(pl.col("permno") == int(permno)).select(cols).unique().collect()
+            names |= set(pn["company_name"].drop_nulls()) if "company_name" in cols else set()
+            ticks |= set(pn["ticker"].drop_nulls()) if "ticker" in cols else set()
     return [{"document_id": str(r["document_id"]), "filing_date": str(r["filing_date"]), "items": str(r["items"]),
-             "text": (r["text"] or "")[:a["max_chars"]]} for r in df.to_dicts()]
+             "text": _txt_anonymise((r["text"] or "")[:a["max_chars"]], names, ticks)} for r in df.to_dicts()]
 
 
 def get_profile(cfg, permno, eom):
-    want = ["ticker", "company_name", "gics", "market_equity", "be_me", "ret_12_1", "beta_60m", "ret_exc"]
+    want = ["gics", "market_equity", "be_me", "ret_12_1", "beta_60m", "ret_exc"]   # no ticker/name: anonymised
     path = cfg["data_files"]["chars"]
     have = [c for c in want if c in pl.read_parquet_schema(path)]
     df = (pl.scan_parquet(path).filter(pl.col("permno") == int(permno))
@@ -1432,6 +1445,7 @@ def get_score(cfg, permno, eom):
 def _agent_dispatch(cfg, name, args, permno, formation_eom):
     """LLM args are untrusted: permno is forced to the held one, dates are capped at formation_eom."""
     cap = _agent_date(formation_eom)
+    name = next((n for n in ("get_filings", "get_profile", "get_score") if str(name).startswith(n.rstrip("s"))), name)
     key = "before_eom" if name == "get_filings" else "eom"
     try:
         d = min(_agent_date(args.get(key)), cap)
@@ -1489,7 +1503,9 @@ def _agent_parse(text):
 
 
 def _agent_norm(s):
-    s = str(s or "").translate({0x2018: 39, 0x2019: 39, 0x201C: 34, 0x201D: 34, 0x2013: 45, 0x2014: 45, 0xA0: 32})
+    s = str(s or "").translate({0x2018: 39, 0x2019: 39, 0x201A: 39, 0x2032: 39, 0x201C: 34, 0x201D: 34, 0x201E: 34,
+                                0x2010: 45, 0x2011: 45, 0x2012: 45, 0x2013: 45, 0x2014: 45, 0x2015: 45, 0x2212: 45,
+                                0xA0: 32, 0x202F: 32, 0x2009: 32, 0x2026: 46})   # LLMs emit typographic variants
     return re.sub(r"\s+", " ", s).strip().lower()
 
 
