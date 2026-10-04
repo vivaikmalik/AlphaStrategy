@@ -119,12 +119,12 @@ def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False):
     return out(te, te_score), out(va_all, va_all_score), info
 
 
-def run_schedule(df, features, cfg, model="xgb", shuffle=False):
-    """Loop over test years. Returns (preds, val_2021, infos)."""
-    tests, infos, val_2021 = [], [], None
+def run_schedule(df, features, cfg, model="xgb", shuffle=False, return_vals=False):
+    """Loop over test years. Returns (preds, val_2021, infos); with return_vals a 4th value {year: that window's val_pred}."""
+    tests, infos, val_2021, vals = [], [], None, {}
     for w in windows(cfg):
         t, v, i = fit_predict_year(df, features, w, cfg, model, shuffle)
-        tests.append(t); infos.append(i)
+        tests.append(t); infos.append(i); vals[w["year"]] = v
         if w["year"] == 2021:
             val_2021 = v
-    return pl.concat(tests), val_2021, infos
+    return (pl.concat(tests), val_2021, infos, vals) if return_vals else (pl.concat(tests), val_2021, infos)

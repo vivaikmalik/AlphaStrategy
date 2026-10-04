@@ -5,7 +5,7 @@ w = wL - wS over the UNION of long candidates (top n by score) and short candida
 import cvxpy as cp
 import numpy as np
 import polars as pl
-from src.risk import risk_exposures
+from src.risk import risk_exposures, lw_factor, _risk_midx
 
 
 def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0, lam_fac=0.0, risk=None):
@@ -297,3 +297,150 @@ def run_book_v3(scored, cfg, smooth):
         w_prev = w
     wdf = pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row")
     return wdf, log
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# book v4: port of the teammate's convex construction (portfolio.py), Ledoit-Wolf risk, Clarabel
+# ---------------------------------------------------------------------------------------------------------------
+def _opt_pred_scores(s):
+    """Teammate's prediction_scores: 2*avg_rank/(N+1)-1 over all finite scores of the month."""
+    from scipy.stats import rankdata
+    return 2.0 * rankdata(s, method="average") / (len(s) + 1.0) - 1.0
+
+
+def _opt_main_lists(permno, s, short_ok, per_side):
+    """Attempt 1: top per_side by score long, then bottom per_side among short-eligible of the rest (disjoint).
+    Ties: permno ascending. Returns index arrays."""
+    order = np.lexsort((permno, -s))
+    longs = order[:per_side]
+    rest = np.setdiff1d(np.where(short_ok)[0], longs)
+    shorts = rest[np.lexsort((permno[rest], s[rest]))][:per_side]
+    return longs, shorts
+
+
+def _opt_fallback_lists(permno, s, short_ok, grp, per_group_max):
+    """Attempt 2: per size group of n names, k = min(per_group_max, n//2) best long and k worst (short-eligible) short."""
+    longs, shorts = [], []
+    for g in np.unique(grp):
+        mem = np.where(grp == g)[0]
+        k = min(per_group_max, len(mem) // 2)
+        if k == 0:
+            continue
+        top = mem[np.lexsort((permno[mem], -s[mem]))][:k]
+        rest = np.setdiff1d(mem[short_ok[mem]], top)
+        bot = rest[np.lexsort((permno[rest], s[rest]))][:k]
+        longs += list(top)
+        shorts += list(bot)
+    return np.array(longs, dtype=int), np.array(shorts, dtype=int)
+
+
+def _opt_solve_v4(longs, shorts, s, beta, grp, fac, fidx, wb, p, cfg):
+    """One convex solve on the given lists. Returns (weights over longs+shorts or None, status)."""
+    n_l, n = len(longs), len(longs) + len(shorts)
+    if len(longs) == 0 or len(shorts) == 0:
+        return None, "empty_side"
+    ix = np.r_[longs, shorts]
+    G = p["gross"]
+    Xc = fac["Xc"][:, fidx[ix]]
+    w, t = cp.Variable(n), cp.Variable(n)
+    risk = (1 - fac["delta"]) / fac["T"] * cp.sum_squares(Xc @ w) + fac["delta"] * fac["mu"] * cp.sum_squares(w)
+    obj = cp.Maximize(s[ix] @ w - p["risk_penalty"] * risk - p["turnover_penalty"] * cp.sum(t))
+    cons = [w[:n_l] >= 0, w[n_l:] <= 0, cp.sum(w[:n_l]) == G / 2, cp.sum(w[n_l:]) == -G / 2,
+            beta[ix] @ w <= cfg["v4_beta_limit"], beta[ix] @ w >= -cfg["v4_beta_limit"], t >= w - wb[ix], t >= wb[ix] - w]
+    gi = grp[ix]
+    tol = cfg["v4_size_balance"] * G / 2
+    for g in np.unique(gi):
+        m = (gi == g).astype(float)
+        cons += [m @ w <= tol, m @ w >= -tol]
+    prob = cp.Problem(obj, cons)
+    try:
+        prob.solve(solver=cp.CLARABEL)
+    except cp.error.SolverError:
+        return None, "solver_error"
+    if prob.status != cp.OPTIMAL or w.value is None:
+        return None, str(prob.status)
+    x = np.where(np.abs(w.value) < 1e-7, 0.0, w.value)       # numeric cleaning, then each side back to exactly G/2
+    x[:n_l], x[n_l:] = np.maximum(x[:n_l], 0.0), np.minimum(x[n_l:], 0.0)
+    if x[:n_l].sum() > 0:
+        x[:n_l] *= G / 2 / x[:n_l].sum()
+    if x[n_l:].sum() < 0:
+        x[n_l:] *= -G / 2 / x[n_l:].sum()
+    return x, "optimal"
+
+
+def _opt_valid_v4(x, ix, beta, grp, p, cfg):
+    """Teammate's check_portfolio on the final weights; returns list of failed rules."""
+    G, tol = p["gross"], 1e-4
+    n_l, n_s = int((x > 0).sum()), int((x < 0).sum())
+    n = n_l + n_s
+    if not np.isfinite(x).all():
+        return ["nan"]
+    bad = []
+    if not (cfg["v4_min_names"] <= n <= cfg["v4_max_names"]):
+        bad.append("names")
+    if n and not (cfg["v4_long_share"][0] <= n_l / n <= cfg["v4_long_share"][1]):
+        bad.append("long_share")
+    if abs(x.sum()) > tol or abs(np.abs(x).sum() - G) > tol:
+        bad.append("net_gross")
+    if abs(beta[ix] @ x) > cfg["v4_beta_limit"] + tol:
+        bad.append("beta")
+    gi = grp[ix]
+    for g in np.unique(gi):
+        m = gi == g
+        if abs(x[m & (x > 0)].sum() / (G / 2) - (-x[m & (x < 0)].sum()) / (G / 2)) > cfg["v4_size_balance"] + tol:
+            bad.append(f"size_{g}")
+    return bad
+
+
+def run_book_v4(scored, cfg, params_by_eom, rets):
+    """Teammate's convex book on our universe. scored: permno, eom, score, short_eligible, beta_60m_raw, size_grp;
+    params_by_eom: eom -> {gross, cov_window, risk_penalty, turnover_penalty}; rets: [permno, eom, ret] monthly panel.
+    -> (weights df[permno, eom, weight], log list). Attempt 1 main lists, 2 size-group fallback, else hold previous."""
+    rets = rets.with_columns(_m=_risk_midx(pl.col("eom")))
+    w_prev, rows, log = {}, [], []
+    for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
+        p = params_by_eom[eom]
+        sc = mdf["score"].to_numpy().astype(float)
+        finite = np.isfinite(sc)
+        mdf, sc = mdf.filter(pl.Series(finite)), sc[finite]
+        ok = (mdf["beta_60m_raw"].is_not_null() & mdf["beta_60m_raw"].is_not_nan() & mdf["size_grp"].is_not_null()).to_numpy()
+        mdf, sc = mdf.filter(pl.Series(ok)), sc[ok]                     # eligible set only (as teammate's lw fit)
+        s_all = _opt_pred_scores(sc) if len(sc) else sc
+        fac = lw_factor(rets, eom, int(p["cov_window"]), mdf["permno"].to_numpy())
+        pm_all = mdf["permno"].to_numpy().astype(np.int64)
+        beta_all = mdf["beta_60m_raw"].to_numpy().astype(float)
+        grp_all = np.array(mdf["size_grp"].cast(pl.Utf8).fill_null("NA").to_list())
+        keep = np.isin(pm_all, fac["permnos"]) & np.isfinite(beta_all) & (grp_all != "NA")
+        pm, s, beta, grp = pm_all[keep], s_all[keep], beta_all[keep], grp_all[keep]
+        short_ok = mdf["short_eligible"].fill_null(False).to_numpy()[keep]
+        fidx = np.searchsorted(fac["permnos"], pm)                       # factor columns (permnos sorted)
+        wb = np.array([w_prev.get(int(q), 0.0) for q in pm])
+        w, ix, status, attempt = None, None, "no_candidates", None
+        for attempt, lists in (("main", lambda: _opt_main_lists(pm, s, short_ok, cfg["v4_per_side"])),
+                               ("fallback", lambda: _opt_fallback_lists(pm, s, short_ok, grp, 50))):
+            lo, sh = lists()
+            x, status = _opt_solve_v4(lo, sh, s, beta, grp, fac, fidx, wb, p, cfg)
+            if x is None:
+                continue
+            ix_try = np.r_[lo, sh]
+            bad = _opt_valid_v4(x, ix_try, beta, grp, p, cfg)
+            if bad:
+                status = "failed:" + ",".join(bad)
+                continue
+            w, ix = x, ix_try
+            break
+        if w is None:                                                     # last resort: hold previous weights
+            new = dict(w_prev)
+            status, attempt = f"hold_prev({status})", "hold"
+            print(f"[optimizer-v4] {eom}: {status}")
+        else:
+            new = {int(pm[i]): float(x_) for i, x_ in zip(ix, w) if x_ != 0}
+        bmap = dict(zip(pm.tolist(), beta.tolist()))
+        bv = sum(v * bmap.get(q, 0.0) for q, v in new.items())
+        turn = sum(abs(new.get(q, 0.0) - w_prev.get(q, 0.0)) for q in set(new) | set(w_prev))
+        log.append({"eom": eom, "n_long": sum(v > 0 for v in new.values()), "n_short": sum(v < 0 for v in new.values()),
+                    "gross": float(sum(abs(v) for v in new.values())), "net": float(sum(new.values())),
+                    "beta_ex_ante": float(bv), "turnover": float(turn), "attempt": attempt, "status": status})
+        rows += [(q, eom, v) for q, v in new.items()]
+        w_prev = new
+    return pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row"), log

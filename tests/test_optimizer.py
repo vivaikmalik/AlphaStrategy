@@ -222,3 +222,58 @@ def test_book_v3():
     w2, _ = run_book_v3(sc2, cfg, 0.5)
     k = date(2020, 2, 28)
     assert w.filter(pl.col("eom") <= k).sort(["eom", "permno"]).equals(w2.filter(pl.col("eom") <= k).sort(["eom", "permno"]))
+
+
+# ---- book v4 ----
+def _v4_data(n=1200, months=40, seed=3):
+    r = np.random.default_rng(seed)
+    eoms = [date(2018 + (m // 12), m % 12 + 1, 28) for m in range(months)]
+    pm = np.arange(1, n + 1, dtype=np.int64)
+    rets = pl.DataFrame({"permno": np.tile(pm, months), "eom": pl.Series([e for e in eoms for _ in pm], dtype=pl.Date),
+                         "ret": 0.10 * r.normal(size=n * months)})
+    grp = r.choice(["nano", "micro", "small", "large", "mega"], n)
+    tail = [eoms[-2], eoms[-1]]
+    sc = pl.concat([pl.DataFrame({"permno": pm, "eom": pl.Series([e] * n, dtype=pl.Date), "score": r.normal(size=n),
+                                  "short_eligible": r.random(n) < 0.7, "beta_60m_raw": 1 + 0.4 * r.normal(size=n),
+                                  "size_grp": grp}) for e in tail])
+    return sc, rets, tail
+
+
+def test_v4_constraints():
+    from src.optimizer import run_book_v4
+    sc, rets, tail = _v4_data()
+    G = 1.5
+    prm = {e: {"gross": G, "cov_window": 24, "risk_penalty": 3000.0, "turnover_penalty": 0.05} for e in tail}
+    w, log = run_book_v4(sc, CFG, prm, rets)
+    assert all(l["attempt"] == "main" for l in log), log
+    for e in tail:
+        d = sc.filter(pl.col("eom") == e).join(w.filter(pl.col("eom") == e), on=["permno", "eom"])
+        ww = d["weight"].to_numpy()
+        assert abs(ww.sum()) < 1e-6 and abs(np.abs(ww).sum() - G) < 1e-6
+        assert abs((d["beta_60m_raw"].to_numpy() * ww).sum()) <= 0.05 + 1e-6
+        assert 100 <= len(ww) <= 500
+        for g in d["size_grp"].unique():
+            assert abs(d.filter(pl.col("size_grp") == g)["weight"].sum()) <= 0.05 + 1e-6
+    assert abs(log[0]["turnover"] - G) < 1e-6 and log[1]["turnover"] > 0
+
+
+def test_v4_lw_no_lookahead_and_risk_penalty():
+    from src.risk import lw_factor, _risk_variance
+    from src.optimizer import run_book_v4
+    sc, rets, tail = _v4_data()
+    eom = date(2020, 1, 28)
+    pm = np.arange(1, 1201)
+    a = lw_factor(rets, eom, 24, pm)
+    r2 = rets.with_columns(ret=pl.when(pl.col("eom") > eom).then(9.0).otherwise(pl.col("ret")))
+    b = lw_factor(r2, eom, 24, pm)
+    assert a["T"] == 24 and np.array_equal(a["Xc"], b["Xc"]) and a["delta"] == b["delta"] and len(a["permnos"]) == 1200
+    c = lw_factor(rets.filter(~((pl.col("permno") == 5) & (pl.col("eom") == date(2019, 6, 28)))), eom, 24, pm)
+    assert 5 not in c["permnos"] and len(c["permnos"]) == 1199
+    last = sc.filter(pl.col("eom") == tail[-1])
+    fac = lw_factor(rets, tail[-1], 24, pm)
+    v = []
+    for rp in (3000.0, 30000.0):
+        w, _ = run_book_v4(last, CFG, {tail[-1]: {"gross": 1.5, "cov_window": 24, "risk_penalty": rp, "turnover_penalty": 0.0}}, rets)
+        idx = np.searchsorted(fac["permnos"], w["permno"].to_numpy())
+        v.append(_risk_variance(fac, w["weight"].to_numpy(), idx))
+    assert v[1] < v[0]

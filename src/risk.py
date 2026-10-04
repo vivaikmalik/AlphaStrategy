@@ -65,3 +65,38 @@ def risk_model(frame, cfg, market=None):
     if market is not None:
         out["b"] = b
     return out
+
+
+def _risk_midx(col):
+    """Date column -> integer calendar-month index (year*12 + month-1)."""
+    return col.dt.year().cast(pl.Int64) * 12 + col.dt.month().cast(pl.Int64) - 1
+
+
+def lw_factor(rets, eom, window, permnos):
+    """Ledoit-Wolf factor form (port of the teammate's ledoit_wolf_factor): Sigma = (1-delta)*Xc'Xc/T + delta*mu*I.
+    rets: pl.DataFrame[permno, eom, ret] (monthly returns, all stocks). Uses months eom-window+1..eom only, and only
+    `permnos` with `window` consecutive finite returns (full_history_mask). -> dict(Xc, delta, mu, T, permnos)."""
+    from sklearn.covariance import ledoit_wolf_shrinkage
+    m1 = eom.year * 12 + eom.month - 1
+    m0 = m1 - window + 1
+    pm = np.unique(np.asarray(list(permnos), dtype=np.int64))
+    if "_m" not in rets.columns:
+        rets = rets.with_columns(_m=_risk_midx(pl.col("eom")))
+    sub = rets.filter((pl.col("_m") >= m0) & (pl.col("_m") <= m1) & pl.col("permno").is_in(pm.tolist()))
+    X = np.full((window, len(pm)), np.nan)
+    if len(sub):
+        X[sub["_m"].to_numpy() - m0, np.searchsorted(pm, sub["permno"].to_numpy())] = sub["ret"].to_numpy().astype(float)
+    ok = np.isfinite(X).all(axis=0)
+    X, pm = X[:, ok], pm[ok]
+    if X.shape[1] == 0:
+        return {"Xc": X, "delta": 0.0, "mu": 0.0, "T": window, "permnos": pm}
+    Xc = X - X.mean(axis=0)
+    delta = float(ledoit_wolf_shrinkage(X, assume_centered=False))
+    mu = float((Xc ** 2).sum() / (X.shape[0] * X.shape[1]))
+    return {"Xc": Xc, "delta": delta, "mu": mu, "T": window, "permnos": pm}
+
+
+def _risk_variance(fac, w, idx):
+    """Ex-ante variance w' Sigma w for weights w on factor columns idx."""
+    x = fac["Xc"][:, idx] @ w
+    return float((1 - fac["delta"]) / fac["T"] * (x @ x) + fac["delta"] * fac["mu"] * (w @ w))

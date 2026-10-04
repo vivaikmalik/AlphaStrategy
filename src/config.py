@@ -136,6 +136,19 @@ CONFIG = {
     "risk_spec_window": 36,                 # trailing months of residuals for specific variance
     "risk_spec_min": 6,
 
+    # --- book v4 (not in spec): port of the teammate's optimizer (D:/Work/Hackathon/teammate, src/fiam/portfolio.py
+    #     + risk.py), on OUR universe. Ledoit-Wolf covariance of monthly panel `ret`; params re-chosen each test
+    #     year on that window's 24 validation months by IR net of v4_fee (grid below).
+    "v4_grid": {"gross": [1.0, 1.5, 2.0], "cov_window": [24, 36], "risk_penalty": [1.0, 10.0, 100.0, 1000.0],
+                "turnover_penalty": [0.0, 0.05, 0.20]},
+    "v4_fee": 0.001,                        # 10 bps per unit turnover, charged when choosing params (as teammate)
+    "v4_beta_limit": 0.05,                  # |beta_60m(raw) . w|
+    "v4_size_balance": 0.05,                # per size group |net weight| <= 0.05
+    "v4_long_share": [0.40, 0.60],          # share of names that are long
+    "v4_per_side": 250,
+    "v4_min_names": 100,
+    "v4_max_names": 500,
+
     # --- analyst agent (spec step A, lite): explains top holdings; never feeds signal or weights ---
     "agent_enabled": True,                  # skipped with a warning if the LLM server is unreachable
     "agent_url": "http://localhost:11434/v1/chat/completions",   # Ollama OpenAI-compatible endpoint on the GX10

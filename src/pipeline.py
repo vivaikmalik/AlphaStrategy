@@ -2,6 +2,7 @@
 src/pipeline.py - Orchestration of steps 1-14: caching, step-10 tuning, step-11 leakage tests, step-12 ablations.
 main(cfg) is called by MAIN.py; one short function per step.
 """
+import itertools
 import json
 import time
 from datetime import date, datetime
@@ -18,7 +19,7 @@ from src.text import event_flags, finbert_doc_tones, tone_features
 from src.kalman import kalman_betas
 from src.ranker import windows, fit_predict_year, run_schedule, rank_ic
 from src.risk import risk_model
-from src.optimizer import run_book, run_book_v2, run_book_v3
+from src.optimizer import run_book, run_book_v2, run_book_v3, run_book_v4
 from src.metrics import load_market, book_returns
 from src.report import performance_pack, write_submission
 from src.agent import run_agent
@@ -307,12 +308,77 @@ def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, rm,
     return frames, choice, grid, chk, fix
 
 
+# ----------------------------------------------------------------------------- book v4 (port of teammate optimizer)
+def _pipe_v4_scored(preds, frame, panel, cfg, rm=None):
+    """Scored frame for run_book_v4: score, short_eligible, size_grp and the RAW beta_60m (joined from the raw panel)."""
+    sc = _pipe_scored(preds, frame, cfg, rm)
+    if "size_grp" in frame.columns:
+        sc = sc.join(frame.select(_PIPE_KEYS + ["size_grp"]), on=_PIPE_KEYS, how="left")
+        extra = []
+    else:
+        extra = ["size_grp"]
+    return sc.join(panel.select(_PIPE_KEYS + extra + [pl.col("beta_60m").alias("beta_60m_raw")]), on=_PIPE_KEYS, how="left")
+
+
+def _pipe_v4_configs(cfg):
+    g = cfg["v4_grid"]
+    return [dict(zip(g, v)) for v in itertools.product(*g.values())]
+
+
+def _pipe_v4_net(rets, cfg):
+    """book_returns frame with the v4 fee charged: total / active / excess minus v4_fee * turnover."""
+    fee = cfg["v4_fee"] * pl.col("turnover")
+    return rets.with_columns(total=pl.col("total") - fee, active=pl.col("active") - fee, excess=pl.col("excess") - fee)
+
+
+def _pipe_v4_job(sc, params, frame, market, v4rets, cfg):
+    w, log = run_book_v4(sc, cfg, {e: params for e in sc["eom"].unique().to_list()}, v4rets)
+    if any(str(r.get("attempt", "")).startswith("hold") for r in log):   # incomplete book: disqualify (as teammate)
+        return float("nan"), float("nan"), float("nan")
+    rets, _ = book_returns(w, frame, market, cfg)
+    return _pipe_ir(_pipe_v4_net(rets, cfg)), _pipe_ir(rets), float(rets["turnover"].mean())
+
+
+def _pipe_v4_tune(vals_by_year, frame, panel, market, cfg, v4rets):
+    """Per test year Y: grid of v4 params on that window's 24 validation months (its train-only val_pred), best IR net of v4_fee.
+    -> (params {year: dict}, log {year: [grid rows]})"""
+    cfgs, params, log = _pipe_v4_configs(cfg), {}, {}
+    for y, vp in sorted(vals_by_year.items()):
+        sc = _pipe_v4_scored(vp, frame, panel, cfg)
+        lo = sc["eom"].min()
+        fr = frame.select("permno", "eom", "ret_exc_lead1m").filter(pl.col("eom") >= lo)        # only what book_returns needs
+        vr = v4rets.filter(pl.col("eom") > pl.lit(lo).dt.offset_by("-40mo"))                   # covers the max cov window
+        res = Parallel(n_jobs=cfg["n_jobs"], backend="loky")(delayed(_pipe_v4_job)(sc, p, fr, market, vr, cfg) for p in cfgs)
+        log[y] = [{**p, "net_ir": r[0], "gross_ir": r[1], "turnover": r[2]} for p, r in zip(cfgs, res)]
+        ok = [(r[0], i) for i, r in enumerate(res) if np.isfinite(r[0])]
+        params[y] = cfgs[max(ok)[1]] if ok else cfgs[0]
+        _pipe_log(f"v4 tuning {y}: {params[y]} net IR {max(ok)[0] if ok else float('nan'):.3f}")
+    return params, log
+
+
+def _pipe_v4_book(preds, frame, cfg, rm, v4, val=False):
+    """v4 book on `preds`: val=True -> constant first-window (2021) params (pre-test); else each eom uses its test year's chosen
+    params (year = target_month.year), w_prev carried across years. -> (weights, log)"""
+    sc = _pipe_v4_scored(preds, frame, v4["panel"], cfg, rm)
+    if val:
+        pm = {e: v4["params"][min(v4["params"])] for e in sc["eom"].unique().to_list()}
+    else:
+        tm = frame.select("eom", "target_month").unique()
+        last = v4["params"][max(v4["params"])]
+        pm = {e: v4["params"].get(t.year, last) for e, t in tm.iter_rows() if t is not None}
+    return run_book_v4(sc, cfg, pm, v4["rets"])
+
+
 # ----------------------------------------------------------------------------- full run + step 11 / 12 helpers
-def _pipe_book(preds, frame, choice, cfg, rm, ic, spec=False):
+def _pipe_book(preds, frame, choice, cfg, rm, ic, spec=False, v4=None):
     """Main book cfg["book"]: "spec" (chosen lambdas), "v2" (alpha = ic * xs_vol * z) or "v3_s<smooth>" (sector-neutral tail book);
     spec=True forces the spec book. Logs the number of months with relaxed constraints. -> (weights, log)"""
-    sc = _pipe_scored(preds, frame, cfg, rm)
     book = "spec" if spec else cfg["book"]
+    if book == "v4":
+        w, log = _pipe_v4_book(preds, frame, cfg, rm, v4, val=bool(v4.get("val")))
+        _pipe_log(f"book v4: {len(log)} months")
+        return w, log
+    sc = _pipe_scored(preds, frame, cfg, rm)
     if book == "v2":
         w, log = run_book_v2(sc, cfg, rm, ic)
     elif book.startswith("v3_s"):
@@ -325,29 +391,29 @@ def _pipe_book(preds, frame, choice, cfg, rm, ic, spec=False):
     return w, log
 
 
-def _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic=None, spec=False):
+def _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic=None, spec=False, v4=None):
     """Main book (see _pipe_book) on `preds` -> (weights, rets, n_missing_returns)."""
-    w, _ = _pipe_book(preds, frame, choice, cfg, rm, ic, spec)
+    w, _ = _pipe_book(preds, frame, choice, cfg, rm, ic, spec, v4)
     rets, n_miss = book_returns(w, frame, market, cfg)
     return w, rets, n_miss
 
 
 def _pipe_candidates(cfg):
-    return ["spec", "v2"] + [f"v3_s{x}" for x in cfg["v3_smooth_grid"]]
+    return ["spec", "v2"] + [f"v3_s{x}" for x in cfg["v3_smooth_grid"]] + ["v4"]
 
 
-def _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos):
+def _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos, v4=None):
     """cfg["book"] == "auto": pick the candidate with the highest 2019-2020 validation IR (test stats are computed afterwards, for the
     record only). Explicit cfg["book"] is kept. -> (cfg with the chosen book, book_selection dict)"""
     ic_val, ic_test = _pipe_ic_map(infos, frame, cfg, val=True), _pipe_ic_map(infos, frame, cfg)
     cands = _pipe_candidates(cfg) if cfg["book"] == "auto" else [cfg["book"]]
-    val = {c: _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, {**cfg, "book": c}, rm, ic_val)[1], cfg) for c in cands}
+    val = {c: _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, {**cfg, "book": c}, rm, ic_val, v4=v4 and {**v4, "val": True})[1], cfg) for c in cands}
     # market-neutral mandate: only books with |validation beta| <= 0.2 are eligible; else the smallest |beta|
     ok = [c for c in cands if np.isfinite(val[c]["beta"]) and abs(val[c]["beta"]) <= 0.2]
     best = (max(ok, key=lambda c: val[c]["ir"] if np.isfinite(val[c]["ir"]) else -np.inf) if ok
             else min(cands, key=lambda c: abs(val[c]["beta"]) if np.isfinite(val[c]["beta"]) else np.inf))
     cfg = {**cfg, "book": best}
-    test = {c: _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, {**cfg, "book": c}, rm, ic_test)[1], cfg) for c in cands}
+    test = {c: _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, {**cfg, "book": c}, rm, ic_test, v4=v4)[1], cfg) for c in cands}
     _pipe_log("book selection (val IR/beta): " + ", ".join(f"{c} {val[c]['ir']:.3f}/{val[c]['beta']:.3f}" for c in cands) + f" -> {best}")
     return cfg, {"rule": "highest 2019-2020 validation IR among books with |validation beta| <= 0.2", "chosen": best, "validation": val, "test_for_transparency": test}
 
@@ -391,7 +457,7 @@ def _pipe_leak_dups(df):
     return int(df.height - df.unique(subset=_PIPE_KEYS).height)
 
 
-def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market, cfg, rm, infos, shuf_infos=None):
+def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market, cfg, rm, infos, shuf_infos=None, v4=None):
     """Step 11: structural checks plus shuffled-label run (test IC and IR should be ~0)."""
     ev = frame.filter(pl.col("has_filing") == 1) if "has_filing" in frame.columns else frame.head(0)
     out = {"filings": _pipe_leak_filings(filings, ev) if ev.height else {"flagged_without_filing": 0, "filing_after_eom": 0},
@@ -400,7 +466,7 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
            "duplicate_permno_eom": _pipe_leak_dups(frame),
            "train_target_month_violations": _pipe_leak_target_months(infos),
            "shuffled_ic": _pipe_ic(preds_shuf, frame, cfg)}
-    _, rets, _ = _pipe_run_book_stats(preds_shuf, frame, choice, market, cfg, rm, _pipe_ic_map(shuf_infos or infos, frame, cfg))
+    _, rets, _ = _pipe_run_book_stats(preds_shuf, frame, choice, market, cfg, rm, _pipe_ic_map(shuf_infos or infos, frame, cfg), v4=v4)
     out["shuffled_ir"] = _pipe_ir(rets)
     out["shuffled_beta"] = _pipe_beta(rets, cfg)
     out["passed_structural"] = (out["filings"]["flagged_without_filing"] == 0 and out["filings"]["filing_after_eom"] == 0
@@ -413,12 +479,12 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
     return out
 
 
-def _pipe_ablations(frame, runs, choice, market, cfg, rm):
+def _pipe_ablations(frame, runs, choice, market, cfg, rm, v4=None):
     """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4 and 5. Main book, each ablation's own val ICs."""
-    jobs = [(r["preds"], _pipe_ic_map(r["infos"], frame, cfg)) if k == "preds" else (r["val"], _pipe_ic_map(r["infos"], frame, cfg, val=True))
+    jobs = [(r["preds"], _pipe_ic_map(r["infos"], frame, cfg), v4) if k == "preds" else (r["val"], _pipe_ic_map(r["infos"], frame, cfg, val=True), v4 and {**v4, "val": True})
             for r in runs.values() for k in ("preds", "val")]
     books = Parallel(n_jobs=min(cfg["n_jobs"], len(jobs)), backend="loky")(
-        delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm, ic) for p, ic in jobs)
+        delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm, ic, False, v4_) for p, ic, v4_ in jobs)
     out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (XGB); missing-value flags enter from "
                             "ablation 3 onward; 5 = full main feature set. val_ir/val_beta: book on 2021-window val_pred."}
     for i, (name, r) in enumerate(runs.items()):
@@ -466,24 +532,32 @@ def main(cfg):
     _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs}, "settings_log.json", cfg)
 
     # step 5 + 9: full schedule, predictions, book, performance, submission
-    preds, val_2021, infos = run_schedule(frame, full, cfg)
+    preds, val_2021, infos, vals_y = run_schedule(frame, full, cfg, return_vals=True)
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
     ic_test = _pipe_ic_map(infos, frame, cfg)           # per test year: that window's validation IC (a pre-test quantity)
-    cfg, book_sel = _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos)
-    weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic_test)
+    # book v4: params per test year tuned on that window's validation months only (net of v4_fee)
+    v4rets = panel.select("permno", "eom", "ret")
+    v4_params, v4_log = _pipe_v4_tune(vals_y, frame, panel, market, cfg, v4rets)
+    v4 = {"params": v4_params, "rets": v4rets, "panel": panel.select([c for c in ("permno", "eom", "beta_60m", "size_grp") if c in panel.columns])}
+    _pipe_dump({"v4_tuning": v4_log, "v4_chosen": v4_params}, "settings_log.json", cfg)
+    cfg, book_sel = _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos, v4)
+    weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic_test, v4=v4)
+    net_stats = {"fee": cfg["v4_fee"], "ir_net_of_fee": _pipe_ir(_pipe_v4_net(rets, cfg)), "ir_gross": _pipe_ir(rets),
+                 "mean_turnover": float(rets["turnover"].mean())}
     _pipe_log(f"full book ({cfg['book']}): IR {_pipe_ir(rets):.3f}, missing returns {n_miss}")
     # comparison: spec book on the same test predictions; main book on 2019-2020 validation (a check, nothing tuned on it)
     test_stats = _pipe_stats(rets, cfg)
-    spec_book = _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, cfg, rm, spec=True)[1], cfg)
-    v2_val = _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, cfg, rm, _pipe_ic_map(infos, frame, cfg, val=True))[1], cfg)
+    spec_book = _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, cfg, rm, spec=True, v4=v4)[1], cfg)
+    v2_val = _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, cfg, rm, _pipe_ic_map(infos, frame, cfg, val=True), v4=v4 and {**v4, "val": True})[1], cfg)
     _pipe_log(f"{cfg['book']} test IR {test_stats['ir']:.3f} beta {test_stats['beta']:.3f} | spec test IR {spec_book['ir']:.3f} "
               f"beta {spec_book['beta']:.3f} | {cfg['book']} val IR {v2_val['ir']:.3f} beta {v2_val['beta']:.3f}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
     _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos,
                 "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
-                "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel},
+                "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel,
+                "v4_tuning": v4_log, "v4_chosen": v4_params, "chosen_book_net_of_fee": net_stats},
                "settings_log.json", cfg)
 
     # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
@@ -497,11 +571,11 @@ def main(cfg):
         runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
         _pipe_log(f"ablation {name} done")
     runs["5_plus_tone"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
-    _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm), "ablations.json", cfg)
+    _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm, v4), "ablations.json", cfg)
 
     # step 11: leakage tests incl. shuffled-label run
     shuf, _, shuf_infos = run_schedule(frame, full, cfg, shuffle=True)
-    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos, shuf_infos)
+    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos, shuf_infos, v4)
     _pipe_dump(leak, "leakage_tests.json", cfg)
     assert leak["filings"]["flagged_without_filing"] == 0 and leak["filings"]["filing_after_eom"] == 0,         f"leakage: filing_date after eom / flagged without filing: {leak['filings']}"
     assert leak["window_violations"] == 0, "leakage: train < val < test window ordering violated"
