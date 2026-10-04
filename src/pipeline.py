@@ -520,28 +520,33 @@ def main(cfg):
     rm = risk_model(frames[cfg["gru_d_grid"][0]], cfg, market)     # once per run: independent of d, betas, short_me_q
     _pipe_log(f"risk model: {len(rm['L'])} months with a covariance, {time.time() - t0:.1f}s")
 
-    # step 10: tuning on 2019-2020 validation
-    choice, grid, val_rets, vals = _pipe_tune(frames, feats, market, cfg, rm)
-    beta_chk, beta_fix = _pipe_beta_check(val_rets, cfg), None
-    if beta_chk["warning"]:
-        frames, choice, grid2, beta_chk, beta_fix = _pipe_beta_fix(df, panel, frames, feats, vals, choice, beta_chk, market, cfg, rm, logs)
-        if grid2:
-            beta_fix["grid_kf"], grid = grid, grid2
-    _pipe_log(f"step 10 choice {choice}; validation beta {beta_chk}")
-    d = choice["d"]
-    frame = _pipe_with_short(frames[d], choice["short_me_q"], cfg)
+    # step 10a: non-CFI validation fit, used ONLY to choose d (GRU size); the portfolio parameters are re-chosen in 10b on the CFI scores
+    choice_10a, _, _, _ = _pipe_tune(frames, feats, market, cfg, rm)
+    _pipe_log(f"step 10a choice (d only) {choice_10a}")
+    d = choice_10a["d"]
     full = feats[d]
-    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs}, "settings_log.json", cfg)
 
-    # step 5 + 9: full schedule, predictions, book, performance, submission
+    # step 5 + 9: full schedule (CFI) on the 10a frame; beta variants only change optimizer inputs, not XGB features
     cfi = {"cfi_factors": factors} if cfg.get("cfi_enabled") else {}
-    preds, val_2021, infos, vals_y = run_schedule(frame, full, cfg, return_vals=True, **cfi)
+    preds, val_2021, infos, vals_y = run_schedule(_pipe_with_short(frames[d], choice_10a["short_me_q"], cfg), full, cfg, return_vals=True, **cfi)
     cfi_log = {}
     for i in infos:
         c = i.get("cfi")
         if c:
             cfi_log[i["year"]] = c
             _pipe_log(f"cfi {i['year']}: {c['chosen']} n_factors={c['n_factors']} val IC {c['val_ic_base']:.4f} -> {c['val_ic_chosen']:.4f}")
+
+    # step 10b: portfolio grid for the chosen d on the CFI validation scores (the signal the book is traded on), then beta check / fix
+    cfg_d = {**cfg, "gru_d_grid": [d]}
+    choice, grid, val_rets, _ = _pipe_tune(frames, feats, market, cfg_d, rm, {d: val_2021})
+    beta_chk, beta_fix = _pipe_beta_check(val_rets, cfg), None
+    if beta_chk["warning"]:
+        frames, choice, grid2, beta_chk, beta_fix = _pipe_beta_fix(df, panel, frames, feats, {d: val_2021}, choice, beta_chk, market, cfg_d, rm, logs)
+        if grid2:
+            beta_fix["grid_kf"], grid = grid, grid2
+    _pipe_log(f"step 10b choice {choice}; validation beta {beta_chk}")
+    frame = _pipe_with_short(frames[d], choice["short_me_q"], cfg)
+    _pipe_dump({"choice_10a": choice_10a, "choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs}, "settings_log.json", cfg)
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
     ic_test = _pipe_ic_map(infos, frame, cfg)           # per test year: that window's validation IC (a pre-test quantity)
@@ -563,7 +568,7 @@ def main(cfg):
               f"beta {spec_book['beta']:.3f} | {cfg['book']} val IR {v2_val['ir']:.3f} beta {v2_val['beta']:.3f}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
-    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos, "cfi": cfi_log,
+    _pipe_dump({"choice_10a": choice_10a, "choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos, "cfi": cfi_log,
                 "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
                 "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel,
                 "v4_tuning": v4_log, "v4_chosen": v4_params, "chosen_book_net_of_fee": net_stats},

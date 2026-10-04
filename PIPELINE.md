@@ -75,6 +75,8 @@ Conventions that hold everywhere:
 
 Detailed in section 4. In short: for each d, fit the XGBoost ranker for the 2021 window (train through 2018-12, validate on 2019-2020), build the validation book for every combination of `lambda_tc`, `lambda_beta`, short-eligible ME percentile, `lambda_risk`, `lambda_fac`, and pick the combination with the highest 2019-2020 IR. Then `_pipe_beta_check` regresses the chosen validation book on the S&P 500; if `|t| > beta_check_t` (1.96) the beta is clearly nonzero and the beta variants are tried (section 4). The final choice is frozen for all test years. It writes `output/settings_log.json` (choice, beta check, beta fix, full grid, GRU logs).
 
+**10a / 10b.** Step 10 runs in two parts so the book is tuned on the signal it trades. 10a (the non-CFI fit above) is used only to choose d; it is logged as `choice_10a`. The main CFI walk-forward then runs, and 10b reruns the portfolio grid for that d on the CFI 2019-2020 validation scores (`val_2021`), followed by the beta check / fix; this final `choice` is used by book selection, the full book, ablations and the shuffled run. A beta-variant swap only changes optimizer inputs (`beta_kf`, `beta_var`), not XGB features, so the CFI predictions stay valid.
+
 ### 2.7 Main walk-forward run (steps 5, 9, 13, 14)
 
 - Feature set `full` for the chosen d = 147 ranked factors + `_miss` flags + `gru_1..gru_d` + event columns (21: `has_filing`, `n_filings`, 14 `item_*`, 5 `hist_*`) + 3 tone columns.
