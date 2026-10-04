@@ -1499,7 +1499,14 @@ def _agent_parse(text):
                 return json.loads(m.group(0))
             except Exception:
                 pass
-    return {"thesis": (text or "")[:500], "facts": [], "risks": [], "confidence": 0.0}
+    return {"thesis": _agent_thesis(text), "facts": [], "risks": [], "confidence": 0.0}
+
+
+def _agent_thesis(text):
+    """Unparseable/truncated JSON: pull out the thesis string if present, else the raw text."""
+    t = str(text or "")
+    m = re.search(r'"thesis"\s*:\s*"((?:[^"\\]|\\.)*)', t, re.S)
+    return (m.group(1).replace('\\"', '"') if m else t)[:800]
 
 
 def _agent_norm(s):
@@ -1606,7 +1613,10 @@ def run_agent(cfg):
                     break
                 print(f"[agent] {h['ticker']} failed: {e}")
                 continue
-        rows.append({**h, **cache[key]})
+        r = {**h, **cache[key]}
+        if str(r.get("thesis", "")).lstrip().startswith("{"):
+            r["thesis"] = _agent_thesis(r["thesis"])
+        rows.append(r)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_p.write_text(json.dumps(cache, default=str), encoding="utf-8")
     kept = sum(len(r["facts"]) for r in rows)
@@ -1956,11 +1966,14 @@ def _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos):
     ic_val, ic_test = _pipe_ic_map(infos, frame, cfg, val=True), _pipe_ic_map(infos, frame, cfg)
     cands = _pipe_candidates(cfg) if cfg["book"] == "auto" else [cfg["book"]]
     val = {c: _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, {**cfg, "book": c}, rm, ic_val)[1], cfg) for c in cands}
-    best = max(cands, key=lambda c: val[c]["ir"] if np.isfinite(val[c]["ir"]) else -np.inf)
+    # market-neutral mandate: only books with |validation beta| <= 0.2 are eligible; else the smallest |beta|
+    ok = [c for c in cands if np.isfinite(val[c]["beta"]) and abs(val[c]["beta"]) <= 0.2]
+    best = (max(ok, key=lambda c: val[c]["ir"] if np.isfinite(val[c]["ir"]) else -np.inf) if ok
+            else min(cands, key=lambda c: abs(val[c]["beta"]) if np.isfinite(val[c]["beta"]) else np.inf))
     cfg = {**cfg, "book": best}
     test = {c: _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, {**cfg, "book": c}, rm, ic_test)[1], cfg) for c in cands}
     _pipe_log("book selection (val IR/beta): " + ", ".join(f"{c} {val[c]['ir']:.3f}/{val[c]['beta']:.3f}" for c in cands) + f" -> {best}")
-    return cfg, {"rule": "highest 2019-2020 validation IR", "chosen": best, "validation": val, "test_for_transparency": test}
+    return cfg, {"rule": "highest 2019-2020 validation IR among books with |validation beta| <= 0.2", "chosen": best, "validation": val, "test_for_transparency": test}
 
 
 def _pipe_leak_filings(filings, feats):

@@ -147,7 +147,14 @@ def _agent_parse(text):
                 return json.loads(m.group(0))
             except Exception:
                 pass
-    return {"thesis": (text or "")[:500], "facts": [], "risks": [], "confidence": 0.0}
+    return {"thesis": _agent_thesis(text), "facts": [], "risks": [], "confidence": 0.0}
+
+
+def _agent_thesis(text):
+    """Unparseable/truncated JSON: pull out the thesis string if present, else the raw text."""
+    t = str(text or "")
+    m = re.search(r'"thesis"\s*:\s*"((?:[^"\\]|\\.)*)', t, re.S)
+    return (m.group(1).replace('\\"', '"') if m else t)[:800]
 
 
 def _agent_norm(s):
@@ -254,7 +261,10 @@ def run_agent(cfg):
                     break
                 print(f"[agent] {h['ticker']} failed: {e}")
                 continue
-        rows.append({**h, **cache[key]})
+        r = {**h, **cache[key]}
+        if str(r.get("thesis", "")).lstrip().startswith("{"):
+            r["thesis"] = _agent_thesis(r["thesis"])
+        rows.append(r)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_p.write_text(json.dumps(cache, default=str), encoding="utf-8")
     kept = sum(len(r["facts"]) for r in rows)
