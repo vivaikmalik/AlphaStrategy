@@ -49,3 +49,18 @@ def test_leak_target_months():
     ok = [dict(year=2021, train_max_target=date(2020, 12, 31))]
     assert _pipe_leak_target_months(ok) == []
     assert len(_pipe_leak_target_months([dict(year=2021, train_max_target=date(2021, 1, 31))])) == 1
+
+
+def test_beta_factor_variant_fallback():
+    import numpy as np
+    from src.pipeline import _pipe_beta_factor
+    cfg = {"risk_factors": ["x"]}
+    e1, e2 = date(2020, 1, 31), date(2020, 2, 29)
+    df = pl.DataFrame({"permno": [1, 2, 1, 2], "eom": [e1, e1, e2, e2], "sector": ["a", "b", "a", "b"],
+                       "x": [1.0, 2.0, 1.0, 2.0], "beta_kf": [0.5] * 4, "beta_var": [0.1] * 4})
+    rm = {"sectors": ["a", "b"], "b": {e1: np.array([1.0, 0.5, 0.0, 0.0])}}
+    out = _pipe_beta_factor(df, cfg, rm)
+    assert out.columns == ["permno", "eom", "beta_kf", "beta_var"] and out.height == 4
+    assert out["beta_kf"].is_finite().all()
+    m = {(r["permno"], r["eom"]): r["beta_kf"] for r in out.iter_rows(named=True)}
+    assert m[(1, e1)] == 1.5 and m[(2, e1)] == 2.0 and m[(1, e2)] == 0.5

@@ -121,7 +121,7 @@ CONFIG = {
     "lambda_fac_grid": [0.0, 300.0, 1000.0, 3000.0, 10000.0],  # lam_fac * monthly factor variance of w
     "kalman_r_floor": 0.05,                 # variant "kf_rfloor": lower bound on every R_j
     "beta_shrink": 0.33,                    # variant "b60_shrunk": (1-0.33)*beta_60m + 0.33*1
-    "beta_variants": ["kf", "kf_rfloor", "b60_shrunk"],
+    "beta_variants": ["kf", "kf_rfloor", "b60_shrunk", "factor"],   # factor = risk-model predicted beta X.b
     "beta_check_t": 1.96,                   # step 10 beta check: |t| above this = clearly nonzero -> fix betas
 
     # --- book v2 (not in spec; added after the first full runs). Every number is a stated assumption or
@@ -2259,11 +2259,25 @@ def _pipe_beta_check(rets, cfg):
     return b
 
 
-def _pipe_beta_variant(name, df, panel, cfg, logs):
+def _pipe_beta_factor(df, cfg, rm):
+    """Factor-model beta per stock-month: exposures(eom rows) @ rm["b"][eom] (b uses returns realised by eom); kf where b missing."""
+    out = []
+    for (e,), g in df.group_by("eom", maintain_order=True):
+        b = (rm.get("b") or {}).get(e)
+        bk = g["beta_kf"].to_numpy().astype(float)
+        if b is not None:
+            bk = risk_exposures(g, rm["sectors"], cfg) @ np.asarray(b, float)
+        out.append(pl.DataFrame({"permno": g["permno"], "eom": g["eom"], "beta_kf": bk, "beta_var": g["beta_var"]}))
+    return df.select(_PIPE_KEYS).join(pl.concat(out), on=_PIPE_KEYS, how="left")
+
+
+def _pipe_beta_variant(name, df, panel, cfg, logs, rm=None):
     """Beta estimates [permno, eom, beta_kf, beta_var] for one variant (kf_rfloor is cached)."""
     kf = df.select(_PIPE_KEYS + ["beta_kf", "beta_var"])
     if name == "kf":
         return kf
+    if name == "factor":
+        return _pipe_beta_factor(df, cfg, rm)
     if name == "kf_rfloor":
         def build():
             return kalman_betas(panel, cfg, r_floor=cfg["kalman_r_floor"])
@@ -2286,7 +2300,7 @@ def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, rm,
     -> (frames, choice, grid, check, log); grid is None when "kf" is kept."""
     fix, swapped = {"variants": {}, "choice_kf": choice, "check_kf": chk}, {}
     for name in cfg["beta_variants"]:
-        swapped[name] = _pipe_swap_beta(frames, _pipe_beta_variant(name, df, panel, cfg, logs))
+        swapped[name] = _pipe_swap_beta(frames, _pipe_beta_variant(name, df, panel, cfg, logs, rm))
         fr = _pipe_with_short(swapped[name][choice["d"]], choice["short_me_q"], cfg)
         v = fix["variants"][name] = _pipe_beta(_pipe_run_book_stats(vals[choice["d"]], fr, choice, market, cfg, rm, spec=True)[1], cfg)
         _pipe_log(f"beta fix: {name} val beta {v['beta']:.3f} (t={v['t']:.2f})")
