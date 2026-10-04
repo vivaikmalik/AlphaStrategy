@@ -108,7 +108,14 @@ CONFIG = {
 
     # --- additions after the first full run (not in spec; chosen on 2019-2020 only) ---
     "size_band": 0.05,                      # |sum size_z * w| <= band; size_z = monthly z-score of log(me_raw)
-    "lambda_risk_grid": [0.0, 30.0, 100.0, 300.0],   # L2 risk penalty lam_risk * sum(w^2) (Sharpe proxy)
+    "lambda_risk_grid": [0.0, 100.0],       # L2 penalty lam_risk * sum(w^2): specific-risk proxy
+    # factor risk model (not in spec): exposures = intercept + these ranked characteristics + sector dummies;
+    # factor returns from monthly cross-sectional OLS of realised returns; covariance over trailing months
+    "risk_factors": ["market_equity", "be_me", "ret_12_1", "ret_1_0", "beta_60m", "ivol_capm_252d",
+                     "ope_be", "at_gr1", "dolvol_126d"],
+    "risk_window": 60,                      # trailing months of factor returns
+    "risk_min_months": 24,
+    "lambda_fac_grid": [0.0, 300.0, 1000.0, 3000.0, 10000.0],  # lam_fac * monthly factor variance of w
     "kalman_r_floor": 0.05,                 # variant "kf_rfloor": lower bound on every R_j
     "beta_shrink": 0.33,                    # variant "b60_shrunk": (1-0.33)*beta_60m + 0.33*1
     "beta_variants": ["kf", "kf_rfloor", "b60_shrunk"],

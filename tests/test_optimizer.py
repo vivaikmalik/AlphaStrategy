@@ -120,3 +120,22 @@ def test_lam_risk_spreads_weights():
     _check(m, w1, i1)
     assert len(w1) >= len(w0) and max(abs(x) for x in w1.values()) <= max(abs(x) for x in w0.values()) + 1e-9
     assert len(w1) > len(w0) or max(abs(x) for x in w1.values()) < max(abs(x) for x in w0.values())
+
+
+def test_lam_fac_lowers_factor_variance():
+    from src.risk import risk_exposures
+    m = _month(seed=9)
+    r = np.random.default_rng(9)
+    cfg = dict(CFG, risk_factors=["a", "b"])
+    m = m.with_columns(a=pl.Series(r.uniform(-1, 1, m.height)), b=pl.Series(r.uniform(-1, 1, m.height)))
+    sectors = sorted(m["sector"].unique().to_list())
+    k = 3 + len(sectors)
+    L = np.linalg.cholesky(np.eye(k) * 1e-3)
+    def fvar(w):
+        d = m.filter(pl.col("permno").is_in(list(w))).sort("permno")
+        v = risk_exposures(d, sectors, cfg).T @ np.array([w[p] for p in d["permno"]])
+        return float(v @ (L @ L.T) @ v)
+    w0, _ = optimize_month(m, {}, 0.0, 0.0, cfg)
+    w1, i1 = optimize_month(m, {}, 0.0, 0.0, cfg, lam_fac=3000.0, risk=(sectors, L))
+    _check(m, w1, i1)
+    assert fvar(w1) < fvar(w0)

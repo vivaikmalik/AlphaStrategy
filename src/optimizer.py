@@ -5,10 +5,11 @@ w = wL - wS over the UNION of long candidates (top n by score) and short candida
 import cvxpy as cp
 import numpy as np
 import polars as pl
+from src.risk import risk_exposures
 
 
-def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0):
-    """mdf: one month with permno, score, short_eligible, beta_kf, beta_var, sector [, size_z] -> (weights dict, info dict)."""
+def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0, lam_fac=0.0, risk=None):
+    """mdf: one month with permno, score, short_eligible, beta_kf, beta_var, sector [, size_z] -> (weights dict, info dict); risk = (sectors, L) adds lam_fac * w'X F X'w."""
     d = mdf.with_columns(pl.col("sector").fill_null("NA")).sort("permno").with_columns(
         ((pl.col("score") - pl.col("score").mean()) / pl.col("score").std()).fill_nan(0.0).fill_null(0.0).alias("s"),
         pl.col("beta_kf").fill_nan(None).fill_null(pl.col("beta_kf").median()),
@@ -37,6 +38,8 @@ def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0):
             cp.abs(bk @ w) <= tol, cp.abs(G @ w) <= band]
     if has_size:
         cons.append(cp.abs(sz @ w) <= sband)                               # not in spec: size-neutral book
+    if lam_fac > 0 and risk is not None:
+        obj = obj - lam_fac * cp.sum_squares(risk[1].T @ (risk_exposures(c, risk[0], cfg).T @ w))   # factor-risk penalty (not in spec)
     prob = cp.Problem(cp.Maximize(obj), cons)
 
     def solve(t_, b_, sb_):
@@ -78,11 +81,12 @@ def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0):
                      "n_short": int((wv < 0).sum()), "turnover": turnover}
 
 
-def run_book(scored, lam_tc, lam_beta, cfg, lam_risk=0.0):
+def run_book(scored, lam_tc, lam_beta, cfg, lam_risk=0.0, lam_fac=0.0, rm=None):
     """scored: all months (permno, eom, score, short_eligible, beta_kf, beta_var, sector) -> (weights df, log)."""
     w_prev, rows, log = {}, [], []
     for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
-        w, info = optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk)
+        risk = (rm["sectors"], rm["L"][eom]) if rm is not None and eom in rm["L"] else None
+        w, info = optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk, lam_fac, risk)
         if info["beta_tol"] is not None and info["beta_tol"] > cfg["beta_tol"]:
             print(f"[optimizer] {eom}: beta tolerance relaxed to {info['beta_tol']:.2f}")
         if info["sector_band"] > cfg["sector_band"]:

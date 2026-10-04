@@ -111,7 +111,14 @@ CONFIG = {
 
     # --- additions after the first full run (not in spec; chosen on 2019-2020 only) ---
     "size_band": 0.05,                      # |sum size_z * w| <= band; size_z = monthly z-score of log(me_raw)
-    "lambda_risk_grid": [0.0, 30.0, 100.0, 300.0],   # L2 risk penalty lam_risk * sum(w^2) (Sharpe proxy)
+    "lambda_risk_grid": [0.0, 100.0],       # L2 penalty lam_risk * sum(w^2): specific-risk proxy
+    # factor risk model (not in spec): exposures = intercept + these ranked characteristics + sector dummies;
+    # factor returns from monthly cross-sectional OLS of realised returns; covariance over trailing months
+    "risk_factors": ["market_equity", "be_me", "ret_12_1", "ret_1_0", "beta_60m", "ivol_capm_252d",
+                     "ope_be", "at_gr1", "dolvol_126d"],
+    "risk_window": 60,                      # trailing months of factor returns
+    "risk_min_months": 24,
+    "lambda_fac_grid": [0.0, 300.0, 1000.0, 3000.0, 10000.0],  # lam_fac * monthly factor variance of w
     "kalman_r_floor": 0.05,                 # variant "kf_rfloor": lower bound on every R_j
     "beta_shrink": 0.33,                    # variant "b60_shrunk": (1-0.33)*beta_60m + 0.33*1
     "beta_variants": ["kf", "kf_rfloor", "b60_shrunk"],
@@ -696,6 +703,44 @@ def run_schedule(df, features, cfg, model="xgb", shuffle=False):
     return pl.concat(tests), val_2021, infos
 
 
+# ===== src/risk.py =====
+"""
+src/risk.py - factor risk model (not in spec): monthly cross-sectional OLS factor returns on
+[intercept, ranked characteristics, sector dummies]; F_t = trailing covariance of factor returns known at eom t.
+"""
+import numpy as np
+import polars as pl
+
+
+def risk_exposures(mdf, sectors, cfg):
+    """One month -> n x k exposures: intercept, cfg risk_factors (nulls -> 0), sector dummies for `sectors`."""
+    cols = mdf.select([pl.col(c).fill_nan(None).fill_null(0.0) for c in cfg["risk_factors"]]).to_numpy().astype(float)
+    sec = mdf["sector"].fill_null("NA").to_numpy()
+    D = (sec[:, None] == np.array(sectors)[None, :]).astype(float)
+    return np.hstack([np.ones((len(mdf), 1)), cols, D])
+
+
+def risk_model(frame, cfg):
+    """frame: permno, eom, sector, ret_exc_lead1m, risk factors -> {"sectors": [...], "L": {eom: k x k Cholesky of F_t}}."""
+    sectors = sorted(frame["sector"].fill_null("NA").unique().to_list())
+    fs = {}                                                                 # eom s -> factor return, realised in month s+1
+    for (s,), g in frame.filter(pl.col("ret_exc_lead1m").is_not_null()).sort("eom").group_by("eom", maintain_order=True):
+        X = risk_exposures(g, sectors, cfg)
+        fs[s] = np.linalg.lstsq(X, g["ret_exc_lead1m"].to_numpy().astype(float), rcond=None)[0]
+    eoms = sorted(fs)
+    known = dict(zip(eoms, pl.Series(eoms).dt.offset_by("1mo").dt.month_end().to_list()))   # f_s known at eom s+1
+    L = {}
+    for t in sorted(frame["eom"].unique().to_list()):
+        past = [fs[s] for s in eoms if known[s] <= t][-cfg["risk_window"]:]
+        if len(past) < cfg["risk_min_months"]:
+            continue
+        F = np.cov(np.array(past), rowvar=False)
+        k = F.shape[0]                                     # few months vs ~22 factors: shrink toward avg variance
+        F = 0.9 * F + 0.1 * np.trace(F) / k * np.eye(k) + 1e-8 * np.eye(k)
+        L[t] = np.linalg.cholesky(F)
+    return {"sectors": sectors, "L": L}
+
+
 # ===== src/optimizer.py =====
 """
 src/optimizer.py - Step 9: long/short portfolio optimiser (cvxpy + Clarabel), one convex problem per month.
@@ -706,8 +751,8 @@ import numpy as np
 import polars as pl
 
 
-def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0):
-    """mdf: one month with permno, score, short_eligible, beta_kf, beta_var, sector [, size_z] -> (weights dict, info dict)."""
+def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0, lam_fac=0.0, risk=None):
+    """mdf: one month with permno, score, short_eligible, beta_kf, beta_var, sector [, size_z] -> (weights dict, info dict); risk = (sectors, L) adds lam_fac * w'X F X'w."""
     d = mdf.with_columns(pl.col("sector").fill_null("NA")).sort("permno").with_columns(
         ((pl.col("score") - pl.col("score").mean()) / pl.col("score").std()).fill_nan(0.0).fill_null(0.0).alias("s"),
         pl.col("beta_kf").fill_nan(None).fill_null(pl.col("beta_kf").median()),
@@ -736,6 +781,8 @@ def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0):
             cp.abs(bk @ w) <= tol, cp.abs(G @ w) <= band]
     if has_size:
         cons.append(cp.abs(sz @ w) <= sband)                               # not in spec: size-neutral book
+    if lam_fac > 0 and risk is not None:
+        obj = obj - lam_fac * cp.sum_squares(risk[1].T @ (risk_exposures(c, risk[0], cfg).T @ w))   # factor-risk penalty (not in spec)
     prob = cp.Problem(cp.Maximize(obj), cons)
 
     def solve(t_, b_, sb_):
@@ -777,11 +824,12 @@ def optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk=0.0):
                      "n_short": int((wv < 0).sum()), "turnover": turnover}
 
 
-def run_book(scored, lam_tc, lam_beta, cfg, lam_risk=0.0):
+def run_book(scored, lam_tc, lam_beta, cfg, lam_risk=0.0, lam_fac=0.0, rm=None):
     """scored: all months (permno, eom, score, short_eligible, beta_kf, beta_var, sector) -> (weights df, log)."""
     w_prev, rows, log = {}, [], []
     for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
-        w, info = optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk)
+        risk = (rm["sectors"], rm["L"][eom]) if rm is not None and eom in rm["L"] else None
+        w, info = optimize_month(mdf, w_prev, lam_tc, lam_beta, cfg, lam_risk, lam_fac, risk)
         if info["beta_tol"] is not None and info["beta_tol"] > cfg["beta_tol"]:
             print(f"[optimizer] {eom}: beta tolerance relaxed to {info['beta_tol']:.2f}")
         if info["sector_band"] > cfg["sector_band"]:
@@ -1151,11 +1199,11 @@ def _pipe_attach_target(preds, frame):
         frame.select(_PIPE_KEYS + ["ret_exc_lead1m"]), on=_PIPE_KEYS, how="left")
 
 
-def _pipe_scored(preds, frame):
-    """Predictions + optimizer inputs (short_eligible, betas, sector, size_z = within-month z of log market cap)."""
+def _pipe_scored(preds, frame, cfg):
+    """Predictions + optimizer inputs (short_eligible, betas, sector, size_z = within-month z of log market cap, risk_factors columns)."""
     lm = pl.when(pl.col("me_raw") > 0).then(pl.col("me_raw").log())
     size_z = ((lm - lm.mean().over("eom")) / lm.std().over("eom")).fill_nan(None).fill_null(0.0).alias("size_z")
-    cols = _PIPE_KEYS + ["short_eligible", "beta_kf", "beta_var", "sector", size_z]
+    cols = _PIPE_KEYS + ["short_eligible", "beta_kf", "beta_var", "sector", size_z] + [c for c in cfg["risk_factors"] if c not in ("sector",)]
     return preds.select(_PIPE_KEYS + ["score"]).join(frame.select(cols), on=_PIPE_KEYS, how="left")
 
 
@@ -1237,14 +1285,14 @@ def _pipe_frame(df, emb, q, cfg):
 
 
 # ----------------------------------------------------------------------------- step 10 tuning
-def _pipe_book_job(scored, ltc, lb, lr, cfg):
+def _pipe_book_job(scored, ltc, lb, lr, lf, rm, cfg):
     """Worker: one optimizer run over all months of `scored`."""
-    return run_book(scored, ltc, lb, cfg, lam_risk=lr)
+    return run_book(scored, ltc, lb, cfg, lam_risk=lr, lam_fac=lf, rm=rm)
 
 
-def _pipe_tune(frames, feats, market, cfg, vals=None):
+def _pipe_tune(frames, feats, market, cfg, rm, vals=None):
     """Step 10: XGB on the 2021 window per d (skipped if `vals` given), then grid over
-    (lam_tc, lam_beta, short_me_q, lam_risk) by validation IR. Validation months only. -> (choice, grid, rets, vals)"""
+    (lam_tc, lam_beta, short_me_q, lam_risk, lam_fac) by validation IR. Validation months only. -> (choice, grid, rets, vals)"""
     win = windows(cfg)[0]
     fit, vals, tasks = vals is None, dict(vals or {}), []
     for d in cfg["gru_d_grid"]:
@@ -1253,21 +1301,21 @@ def _pipe_tune(frames, feats, market, cfg, vals=None):
             _, vals[d], info = fit_predict_year(fr, feats[d], win, cfg)
             _pipe_log(f"tune: d={d} xgb val IC {info.get('val_ic')}")
         for q in cfg["short_me_q_grid"]:
-            sc = _pipe_scored(vals[d], _pipe_with_short(fr, q, cfg))
-            tasks += [(d, ltc, lb, q, lr, sc) for ltc in cfg["lambda_tc_grid"] for lb in cfg["lambda_beta_grid"]
-                      for lr in cfg["lambda_risk_grid"]]
+            sc = _pipe_scored(vals[d], _pipe_with_short(fr, q, cfg), cfg)
+            tasks += [(d, ltc, lb, q, lr, lf, sc) for ltc in cfg["lambda_tc_grid"] for lb in cfg["lambda_beta_grid"]
+                      for lr in cfg["lambda_risk_grid"] for lf in cfg["lambda_fac_grid"]]
     _pipe_log(f"tune: {len(tasks)} optimizer runs on {cfg['n_jobs']} workers")
     res = Parallel(n_jobs=cfg["n_jobs"], backend="loky")(
-        delayed(_pipe_book_job)(sc, ltc, lb, lr, cfg) for d, ltc, lb, q, lr, sc in tasks)
+        delayed(_pipe_book_job)(sc, ltc, lb, lr, lf, rm, cfg) for d, ltc, lb, q, lr, lf, sc in tasks)
     grid, best = [], None
-    for (d, ltc, lb, q, lr, _), (w, log) in zip(tasks, res):
+    for (d, ltc, lb, q, lr, lf, _), (w, log) in zip(tasks, res):
         rets, _ = book_returns(w, frames[d], market, cfg)
         ir = _pipe_ir(rets)
-        grid.append({"d": d, "lam_tc": ltc, "lam_beta": lb, "short_me_q": q, "lam_risk": lr, "val_ir": ir,
+        grid.append({"d": d, "lam_tc": ltc, "lam_beta": lb, "short_me_q": q, "lam_risk": lr, "lam_fac": lf, "val_ir": ir,
                      "n_relaxed_months": sum(1 for r in log if (r.get("beta_tol") or 0) > cfg["beta_tol"] + 1e-12)})
         if np.isfinite(ir) and (best is None or ir > best[0]):
             best = (ir, grid[-1], rets)
-    choice = {k: best[1][k] for k in ["d", "lam_tc", "lam_beta", "short_me_q", "lam_risk"]} | {"val_ir": best[0]}
+    choice = {k: best[1][k] for k in ["d", "lam_tc", "lam_beta", "short_me_q", "lam_risk", "lam_fac"]} | {"val_ir": best[0]}
     return choice, grid, best[2], vals
 
 
@@ -1302,20 +1350,20 @@ def _pipe_swap_beta(frames, bv):
     return {d: fr.drop(["beta_kf", "beta_var"]).join(bv, on=_PIPE_KEYS, how="left") for d, fr in frames.items()}
 
 
-def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, logs):
+def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, rm, logs):
     """Step 10 beta fix: validation beta of each variant at the current choice; if the best is not "kf", redo the grid.
     -> (frames, choice, grid, check, log); grid is None when "kf" is kept."""
     fix, swapped = {"variants": {}, "choice_kf": choice, "check_kf": chk}, {}
     for name in cfg["beta_variants"]:
         swapped[name] = _pipe_swap_beta(frames, _pipe_beta_variant(name, df, panel, cfg, logs))
         fr = _pipe_with_short(swapped[name][choice["d"]], choice["short_me_q"], cfg)
-        v = fix["variants"][name] = _pipe_beta(_pipe_run_book_stats(vals[choice["d"]], fr, choice, market, cfg)[1], cfg)
+        v = fix["variants"][name] = _pipe_beta(_pipe_run_book_stats(vals[choice["d"]], fr, choice, market, cfg, rm)[1], cfg)
         _pipe_log(f"beta fix: {name} val beta {v['beta']:.3f} (t={v['t']:.2f})")
     best = min(fix["variants"], key=lambda n: abs(fix["variants"][n]["beta"]) if np.isfinite(fix["variants"][n]["beta"]) else np.inf)
     fix["chosen"], grid = best, None
     if best != "kf":
         frames = swapped[best]
-        choice, grid, rets, _ = _pipe_tune(frames, feats, market, cfg, vals)
+        choice, grid, rets, _ = _pipe_tune(frames, feats, market, cfg, rm, vals)
         chk = _pipe_beta_check(rets, cfg)
         fix |= {"choice_final": choice, "check_final": chk}
     _pipe_log(f"beta fix: variant {best}; val beta {chk['beta']:.3f} (t={chk['t']:.2f}); choice {choice}")
@@ -1323,9 +1371,10 @@ def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, log
 
 
 # ----------------------------------------------------------------------------- full run + step 11 / 12 helpers
-def _pipe_run_book_stats(preds, frame, choice, market, cfg):
+def _pipe_run_book_stats(preds, frame, choice, market, cfg, rm):
     """Book with chosen lambdas on test predictions -> (weights, rets, IR, beta)."""
-    w, _ = run_book(_pipe_scored(preds, frame), choice["lam_tc"], choice["lam_beta"], cfg, lam_risk=choice["lam_risk"])
+    w, _ = run_book(_pipe_scored(preds, frame, cfg), choice["lam_tc"], choice["lam_beta"], cfg, lam_risk=choice["lam_risk"],
+                    lam_fac=choice["lam_fac"], rm=rm)
     rets, n_miss = book_returns(w, frame, market, cfg)
     return w, rets, n_miss
 
@@ -1369,7 +1418,7 @@ def _pipe_leak_dups(df):
     return int(df.height - df.unique(subset=_PIPE_KEYS).height)
 
 
-def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market, cfg, infos):
+def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market, cfg, rm, infos):
     """Step 11: structural checks plus shuffled-label run (test IC and IR should be ~0)."""
     ev = frame.filter(pl.col("has_filing") == 1) if "has_filing" in frame.columns else frame.head(0)
     out = {"filings": _pipe_leak_filings(filings, ev) if ev.height else {"flagged_without_filing": 0, "filing_after_eom": 0},
@@ -1378,7 +1427,7 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
            "duplicate_permno_eom": _pipe_leak_dups(frame),
            "train_target_month_violations": _pipe_leak_target_months(infos),
            "shuffled_ic": _pipe_ic(preds_shuf, frame, cfg)}
-    _, rets, _ = _pipe_run_book_stats(preds_shuf, frame, choice, market, cfg)
+    _, rets, _ = _pipe_run_book_stats(preds_shuf, frame, choice, market, cfg, rm)
     out["shuffled_ir"] = _pipe_ir(rets)
     out["shuffled_beta"] = _pipe_beta(rets, cfg)
     out["passed_structural"] = (out["filings"]["flagged_without_filing"] == 0 and out["filings"]["filing_after_eom"] == 0
@@ -1391,11 +1440,11 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
     return out
 
 
-def _pipe_ablations(frame, runs, choice, market, cfg):
+def _pipe_ablations(frame, runs, choice, market, cfg, rm):
     """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4 and 5."""
     jobs = [r[k] for r in runs.values() for k in ("preds", "val")]
     books = Parallel(n_jobs=min(cfg["n_jobs"], len(jobs)), backend="loky")(
-        delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg) for p in jobs)
+        delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm) for p in jobs)
     out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (XGB); missing-value flags enter from "
                             "ablation 3 onward; 5 = full main feature set. val_ir/val_beta: book on 2021-window val_pred."}
     for i, (name, r) in enumerate(runs.items()):
@@ -1425,12 +1474,15 @@ def main(cfg):
     gru_cols = lambda d: [f"gru_{i}" for i in range(1, d + 1)]
     feats = {d: base + gru_cols(d) + event_cols + _PIPE_TONE for d in cfg["gru_d_grid"]}
     frames = {d: _pipe_frame(df, embs[d], cfg["short_me_q"], cfg) for d in cfg["gru_d_grid"]}
+    t0 = time.time()
+    rm = risk_model(frames[cfg["gru_d_grid"][0]], cfg)     # once per run: independent of d, betas, short_me_q
+    _pipe_log(f"risk model: {len(rm['L'])} months with a covariance, {time.time() - t0:.1f}s")
 
     # step 10: tuning on 2019-2020 validation
-    choice, grid, val_rets, vals = _pipe_tune(frames, feats, market, cfg)
+    choice, grid, val_rets, vals = _pipe_tune(frames, feats, market, cfg, rm)
     beta_chk, beta_fix = _pipe_beta_check(val_rets, cfg), None
     if beta_chk["warning"]:
-        frames, choice, grid2, beta_chk, beta_fix = _pipe_beta_fix(df, panel, frames, feats, vals, choice, beta_chk, market, cfg, logs)
+        frames, choice, grid2, beta_chk, beta_fix = _pipe_beta_fix(df, panel, frames, feats, vals, choice, beta_chk, market, cfg, rm, logs)
         if grid2:
             beta_fix["grid_kf"], grid = grid, grid2
     _pipe_log(f"step 10 choice {choice}; validation beta {beta_chk}")
@@ -1443,7 +1495,7 @@ def main(cfg):
     preds, val_2021, infos = run_schedule(frame, full, cfg)
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
-    weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg)
+    weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg, rm)
     _pipe_log(f"full book: IR {_pipe_ir(rets):.3f}, missing returns {n_miss}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
@@ -1462,11 +1514,11 @@ def main(cfg):
         runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
         _pipe_log(f"ablation {name} done")
     runs["5_plus_tone"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
-    _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg), "ablations.json", cfg)
+    _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm), "ablations.json", cfg)
 
     # step 11: leakage tests incl. shuffled-label run
     shuf, _, _ = run_schedule(frame, full, cfg, shuffle=True)
-    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, infos)
+    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos)
     _pipe_dump(leak, "leakage_tests.json", cfg)
     assert leak["filings"]["flagged_without_filing"] == 0 and leak["filings"]["filing_after_eom"] == 0,         f"leakage: filing_date after eom / flagged without filing: {leak['filings']}"
     assert leak["window_violations"] == 0, "leakage: train < val < test window ordering violated"
