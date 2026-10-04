@@ -126,7 +126,7 @@ CONFIG = {
 
     # --- book v2 (not in spec; added after the first full runs). Every number is a stated assumption or
     #     estimated on pre-test data, nothing is searched. The spec book is still run and reported for comparison.
-    "book": "v2",                           # "v2" = main book below; "spec" = step-9 optimizer as the main book
+    "book": "spec",                         # main book = higher 2019-2020 validation IR: spec 0.76 vs v2 0.38 -> spec
     "v2_cost": 0.0012,                      # assumed one-way trading cost (12 bps) per unit of |trade|
     "v2_vol_target": 0.08,                  # ex-ante annual volatility cap (factor + specific risk)
     "v2_max_weight": 0.005,                 # 0.5% per name -> ~400-500 names at 200% gross (rules allow 500)
