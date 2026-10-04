@@ -126,7 +126,11 @@ CONFIG = {
 
     # --- book v2 (not in spec; added after the first full runs). Every number is a stated assumption or
     #     estimated on pre-test data, nothing is searched. The spec book is still run and reported for comparison.
-    "book": "spec",                         # main book = higher 2019-2020 validation IR: spec 0.76 vs v2 0.38 -> spec
+    "book": "auto",                         # main book = highest 2019-2020 validation IR among spec / v2 / v3 variants
+    # v3 "classic" book (not in spec): smoothed score, top/bottom decile within each sector, equal weight,
+    # sector-neutral legs, leg sizes set for beta neutrality on beta_kf (net within net_band)
+    "v3_smooth_grid": [1.0, 0.5],           # EMA weight on the current month's z-score (1.0 = no smoothing)
+    "v3_tail": 0.10,                        # top / bottom fraction within each sector
     "v2_cost": 0.0012,                      # assumed one-way trading cost (12 bps) per unit of |trade|
     "v2_vol_target": 0.08,                  # ex-ante annual volatility cap (factor + specific risk)
     "v2_max_weight": 0.005,                 # 0.5% per name -> ~400-500 names at 200% gross (rules allow 500)
@@ -134,6 +138,15 @@ CONFIG = {
     "v2_ic_floor": 0.01,                    # IC used to scale alpha = IC * xs_vol * z (each window's validation IC)
     "risk_spec_window": 36,                 # trailing months of residuals for specific variance
     "risk_spec_min": 6,
+
+    # --- analyst agent (spec step A, lite): explains top holdings; never feeds signal or weights ---
+    "agent_enabled": True,                  # skipped with a warning if the LLM server is unreachable
+    "agent_url": "http://localhost:11434/v1/chat/completions",   # Ollama OpenAI-compatible endpoint on the GX10
+    "agent_model": "gpt-oss:20b",
+    "agent_max_steps": 4,
+    "agent_top_n": 10,
+    "agent_max_filings": 5,
+    "agent_max_chars": 6000,
 
     # --- step 10 grids (fixed once on 2019-2020, then frozen) ---
     "gru_d_grid": [8, 16, 32],
@@ -1002,6 +1015,89 @@ def run_book_v2(scored, cfg, rm, ic):
     return wdf, log
 
 
+def _opt_cap(w, cap, total):
+    """Scale positive array w to sum `total`, cap each at `cap`, redistribute the excess to uncapped names. -> (w, capped?)"""
+    w = w / w.sum() * total
+    capped = False
+    for _ in range(50):
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        capped = True
+        w = np.where(over, cap, w)
+        free = ~over & (w < cap - 1e-12)
+        if not free.any() or total - w[~free].sum() <= 0:
+            break
+        w[free] *= (total - w[~free].sum()) / w[free].sum()
+    return w, capped
+
+
+def run_book_v3(scored, cfg, smooth):
+    """Sector-neutral equal-weight tail book on smoothed z-scores, beta-neutral legs. scored: permno, eom, score, short_eligible,
+    sector, beta_kf -> (weights df[permno, eom, weight], log list of dicts)."""
+    prev_s, w_prev, rows, log = {}, {}, [], []
+    for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
+        sc = mdf["score"].to_numpy().astype(float)
+        sc = np.where(np.isfinite(sc), sc, np.nan)
+        sd = np.nanstd(sc, ddof=1) if np.isfinite(sc).sum() > 1 else 0.0
+        z = np.nan_to_num((sc - np.nanmean(sc)) / sd) if sd > 0 else np.zeros(len(sc))
+        pm = mdf["permno"].to_list()
+        s = np.array([smooth * zi + (1 - smooth) * prev_s.get(p, zi) for p, zi in zip(pm, z)])
+        prev_s = dict(zip(pm, s))
+        beta = mdf["beta_kf"].to_numpy().astype(float)
+        beta = np.where(np.isfinite(beta), beta, np.nanmedian(beta) if np.isfinite(beta).any() else 1.0)
+        elig = mdf["short_eligible"].fill_null(False).to_numpy()
+        sec = np.array(mdf["sector"].fill_null("NA").cast(pl.Utf8).to_list())
+        tail = cfg["v3_tail"]
+        while True:                               # competition rule: <= 500 names -> shrink the tail until it fits
+            longs, shorts, budget = [], [], []    # per kept sector: index arrays + stock count
+            for sname in np.unique(sec):
+                idx = np.where(sec == sname)[0]
+                nl = int(np.ceil(tail * len(idx)))
+                top = idx[np.argsort(-s[idx], kind="stable")[:nl]]
+                cand = idx[elig[idx] & ~np.isin(idx, top)]
+                ns = int(np.ceil(tail * elig[idx].sum()))
+                bot = cand[np.argsort(s[cand], kind="stable")[:ns]]
+                if len(top) and len(bot):
+                    longs.append(top); shorts.append(bot); budget.append(len(idx))
+            if sum(len(x) for x in longs + shorts) <= 500 or tail <= 0.02:
+                break
+            tail -= 0.01
+        flags = []
+        if not longs:
+            log.append({"eom": eom, "n_long": 0, "n_short": 0, "gross": 0.0, "net": 0.0, "beta_exposure": 0.0, "turnover": sum(abs(x) for x in w_prev.values()), "flags": ["empty"]})
+            w_prev = {}
+            continue
+        budget = np.array(budget, float) / sum(budget)
+        li, si = np.concatenate(longs), np.concatenate(shorts)
+        lw = np.concatenate([np.full(len(a), b / len(a)) for a, b in zip(longs, budget)])
+        sw = np.concatenate([np.full(len(a), b / len(a)) for a, b in zip(shorts, budget)])
+        bl, bs = float(lw @ beta[li]), float(sw @ beta[si])
+        g = cfg["gross"]
+        L = g * bs / (bl + bs) if bl + bs > 1e-9 else g / 2
+        if abs(2 * L - g) > cfg["net_band"]:
+            L = (g + np.sign(2 * L - g) * cfg["net_band"]) / 2
+            flags.append("net_clipped")
+        S = g - L
+        lw, c1 = _opt_cap(lw, cfg["max_weight"], L)
+        sw, c2 = _opt_cap(sw, cfg["max_weight"], S)
+        if c1 or c2:
+            flags.append("max_weight_capped")
+        n_names = len(li) + len(si)
+        if n_names > 500:
+            flags.append("names_gt_500")
+            print(f"[optimizer-v3] {eom}: {n_names} names > 500")
+        w = {int(pm[i]): float(x) for i, x in zip(li, lw)}
+        w.update({int(pm[i]): -float(x) for i, x in zip(si, sw)})
+        turn = sum(abs(w.get(p, 0.0) - w_prev.get(p, 0.0)) for p in set(w) | set(w_prev))
+        log.append({"eom": eom, "n_long": len(li), "n_short": len(si), "gross": float(lw.sum() + sw.sum()), "net": float(lw.sum() - sw.sum()),
+                    "beta_exposure": float(lw @ beta[li] - sw @ beta[si]), "turnover": float(turn), "flags": flags})
+        rows += [(p, eom, x) for p, x in w.items()]
+        w_prev = w
+    wdf = pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row")
+    return wdf, log
+
+
 # ===== src/metrics.py =====
 """
 src/metrics.py - Step 13 numbers: monthly book returns, summary statistics, OOS R2 and rank-IC summary.
@@ -1252,6 +1348,261 @@ def write_submission(weights, panel, filings, rets, cfg) -> dict:
     if unl:
         print(f"WARNING: {len(unl)} stocks stay unlabeled after 8-K fill: {unl[:20]}")
     return {"unlabeled_permnos": unl}
+
+
+# ===== src/agent.py =====
+"""Explanation agent: LLM (tool calling) explains existing holdings; verifier keeps only quotes found in filings.
+Explanations only - never feeds the signal or portfolio weights."""
+import json
+import re
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import polars as pl
+
+_AGENT_NOTE = ("explanations only; not used in portfolio construction; LLM pretraining may postdate the "
+               "formation date, so explanations are post-hoc")
+_AGENT_SYSTEM = (
+    "You are a buy-side analyst. Explain why the systematic model is long/short this stock at this date using "
+    "ONLY tool outputs (get_filings, get_profile, get_score). Every fact must carry a verbatim quote from a filing "
+    "plus its document_id. Use no knowledge after the formation date. Reply with strict JSON: "
+    '{"thesis": str, "facts": [{"fact": str, "quote": str, "document_id": str}], "risks": [str], "confidence": 0-1}.')
+_AGENT_TOOLS = [
+    {"type": "function", "function": {"name": n, "description": d, "parameters": {
+        "type": "object", "properties": {"permno": {"type": "integer"}, p: {"type": "string", "description": "YYYY-MM-DD"}},
+        "required": ["permno", p]}}}
+    for n, d, p in [("get_filings", "Recent 8-K filings filed on/before before_eom", "before_eom"),
+                    ("get_profile", "Known characteristics at month-end eom", "eom"),
+                    ("get_score", "Model score and within-month percentile at eom", "eom")]]
+
+
+def _agent_date(x):
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, date):
+        return x
+    return date.fromisoformat(str(x)[:10])
+
+
+def _agent_cfg(cfg):
+    return {"url": cfg.get("agent_url", "http://localhost:11434/v1/chat/completions"),
+            "model": cfg.get("agent_model", "gpt-oss:20b"), "steps": int(cfg.get("agent_max_steps", 4)),
+            "top_n": int(cfg.get("agent_top_n", 10)), "max_filings": int(cfg.get("agent_max_filings", 5)),
+            "max_chars": int(cfg.get("agent_max_chars", 6000))}
+
+
+def get_filings(cfg, permno, before_eom):
+    """8-K filings for permno with filing_date <= before_eom (look-ahead control), latest first."""
+    a = _agent_cfg(cfg)
+    d = _agent_date(before_eom)
+    df = (pl.scan_parquet(cfg["data_files"]["8k"]).filter(pl.col("permno") == int(permno))
+          .select(["document_id", "permno", "filing_date", "items", "text"])
+          .with_columns(pl.col("filing_date").cast(pl.Date))
+          .filter(pl.col("filing_date") <= d).sort("filing_date", descending=True).head(a["max_filings"]).collect())
+    return [{"document_id": str(r["document_id"]), "filing_date": str(r["filing_date"]), "items": str(r["items"]),
+             "text": (r["text"] or "")[:a["max_chars"]]} for r in df.to_dicts()]
+
+
+def get_profile(cfg, permno, eom):
+    want = ["ticker", "company_name", "gics", "market_equity", "be_me", "ret_12_1", "beta_60m", "ret_exc"]
+    path = cfg["data_files"]["chars"]
+    have = [c for c in want if c in pl.read_parquet_schema(path)]
+    df = (pl.scan_parquet(path).filter(pl.col("permno") == int(permno))
+          .select(["permno", "eom"] + have).with_columns(pl.col("eom").cast(pl.Date))
+          .filter(pl.col("eom") == _agent_date(eom)).collect())
+    if df.height == 0:
+        return {}
+    return {k: (str(v) if k in ("ticker", "company_name", "gics") else v) for k, v in df.select(have).to_dicts()[0].items()}
+
+
+def get_score(cfg, permno, eom):
+    p = Path(cfg["output_dir"]) / "predictions.parquet"
+    if not p.exists():
+        return {}
+    df = (pl.scan_parquet(p).select(["permno", "eom", "score"]).with_columns(pl.col("eom").cast(pl.Date))
+          .filter(pl.col("eom") == _agent_date(eom)).collect())
+    if df.height == 0:
+        return {}
+    df = df.with_columns(((pl.col("score").rank() - 1) / max(df.height - 1, 1)).alias("pct"))
+    r = df.filter(pl.col("permno") == int(permno))
+    return {"score": r["score"][0], "percentile": r["pct"][0], "n_stocks": df.height} if r.height else {}
+
+
+def _agent_dispatch(cfg, name, args, permno, formation_eom):
+    """LLM args are untrusted: permno is forced to the held one, dates are capped at formation_eom."""
+    cap = _agent_date(formation_eom)
+    key = "before_eom" if name == "get_filings" else "eom"
+    try:
+        d = min(_agent_date(args.get(key)), cap)
+    except Exception:
+        d = cap
+    if name == "get_filings":
+        return get_filings(cfg, permno, d)
+    if name == "get_profile":
+        return get_profile(cfg, permno, d)
+    if name == "get_score":
+        return get_score(cfg, permno, d)
+    return {"error": f"unknown tool {name}"}
+
+
+def _agent_conn_err(e):
+    import socket
+    import urllib.error
+    try:
+        import requests
+        if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            return True
+    except ImportError:
+        pass
+    return isinstance(e, (urllib.error.URLError, socket.timeout, ConnectionError))
+
+
+def _agent_post(cfg, payload):
+    url = _agent_cfg(cfg)["url"]
+    try:
+        import requests
+    except ImportError:
+        requests = None
+    if requests is not None:
+        r = requests.post(url, json=payload, timeout=(5, 120))
+        r.raise_for_status()
+        return r.json()
+    import urllib.request
+    req = urllib.request.Request(url, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _agent_parse(text):
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
+    try:
+        return json.loads(t)
+    except Exception:
+        m = re.search(r"\{.*\}", t, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    return {"thesis": (text or "")[:500], "facts": [], "risks": [], "confidence": 0.0}
+
+
+def _agent_norm(s):
+    s = str(s or "").translate({0x2018: 39, 0x2019: 39, 0x201C: 34, 0x201D: 34, 0x2013: 45, 0x2014: 45, 0xA0: 32})
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _agent_verify(facts, filings, formation_eom=None):
+    """Keep a fact only if its quote occurs in the cited filing text (or any fetched filing if id missing).
+    Only filings with filing_date <= formation_eom are eligible."""
+    if formation_eom is not None:
+        cap = _agent_date(formation_eom)
+        filings = [f for f in filings if _agent_date(f["filing_date"]) <= cap]
+    by_id = {str(f["document_id"]): _agent_norm(f["text"]) for f in filings}
+    kept, dropped = [], []
+    for f in facts if isinstance(facts, list) else []:
+        q = _agent_norm(f.get("quote")) if isinstance(f, dict) else ""
+        did = str(f.get("document_id", "") or "") if isinstance(f, dict) else ""
+        pool = [by_id[did]] if did in by_id else (list(by_id.values()) if not did else [])
+        (kept if q and any(q in t for t in pool) else dropped).append(f)
+    return kept, dropped
+
+
+def _agent_explain(cfg, permno, eom, side):
+    a = _agent_cfg(cfg)
+    ask = f"Stock permno={permno}, side={side.upper()}, formation month-end {eom}. Explain the position."
+    msgs = [{"role": "system", "content": _AGENT_SYSTEM}, {"role": "user", "content": ask}]
+    calls, filings, steps, content = [], [], 0, None
+    try:
+        for _ in range(a["steps"]):
+            msg = _agent_post(cfg, {"model": a["model"], "messages": msgs, "tools": _AGENT_TOOLS})["choices"][0]["message"]
+            steps += 1
+            tcs = msg.get("tool_calls") or []
+            if not tcs:
+                content = msg.get("content")
+                break
+            msgs.append(msg)
+            for tc in tcs:
+                fn = tc["function"]
+                args = fn["arguments"]
+                args = json.loads(args) if isinstance(args, str) else args
+                out = _agent_dispatch(cfg, fn["name"], args, permno, eom)
+                if fn["name"] == "get_filings":
+                    filings += out
+                calls.append({"name": fn["name"], "args": args})
+                msgs.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": json.dumps(out, default=str)})
+        if content is None:  # step budget used up: force an answer
+            msgs.append({"role": "user", "content": "Give the final JSON now."})
+            content = _agent_post(cfg, {"model": a["model"], "messages": msgs})["choices"][0]["message"].get("content")
+            steps += 1
+    except Exception as e:
+        if _agent_conn_err(e):
+            raise
+        # no tool-calling support: prefetch all tools, ask once
+        print(f"[agent] tool mode failed ({type(e).__name__}); prefetch fallback")
+        filings = get_filings(cfg, permno, eom)
+        calls = [{"name": "get_filings", "args": {"permno": permno, "before_eom": eom}},
+                 {"name": "get_profile", "args": {"permno": permno, "eom": eom}},
+                 {"name": "get_score", "args": {"permno": permno, "eom": eom}}]
+        ctx = {"get_filings": filings, "get_profile": get_profile(cfg, permno, eom), "get_score": get_score(cfg, permno, eom)}
+        m2 = [{"role": "system", "content": _AGENT_SYSTEM},
+              {"role": "user", "content": ask + "\nTool outputs:\n" + json.dumps(ctx, default=str)}]
+        content = _agent_post(cfg, {"model": a["model"], "messages": m2})["choices"][0]["message"].get("content")
+        steps = 1
+    res = _agent_parse(content)
+    kept, dropped = _agent_verify(res.get("facts"), filings, eom)
+    return {"thesis": res.get("thesis", ""), "facts": kept, "dropped_facts": dropped, "risks": res.get("risks", []),
+            "confidence": res.get("confidence", 0.0), "tool_calls": calls, "steps": steps}
+
+
+def _agent_pick(hold_path, top_n):
+    h = pl.read_csv(hold_path, try_parse_dates=True).with_columns(pl.col("Date").cast(pl.Date))
+    h = h.with_columns(pl.col("WEIGHT" if "WEIGHT" in h.columns else "WEIGHT %").cast(pl.Float64).alias("w"))
+    g = h.group_by("PERMNO").agg(pl.col("w").abs().mean().alias("avg_abs"), pl.col("w").mean().alias("avg_w"),
+                                 pl.col("TICKER").first(), pl.col("COMPANY NAME").first())
+    out = []
+    for side, sub in (("long", g.filter(pl.col("avg_w") > 0)), ("short", g.filter(pl.col("avg_w") < 0))):
+        for r in sub.sort("avg_abs", descending=True).head(top_n).to_dicts():
+            peak = h.filter(pl.col("PERMNO") == r["PERMNO"]).sort(pl.col("w").abs(), descending=True)["Date"][0]
+            out.append({"permno": int(r["PERMNO"]), "ticker": r["TICKER"], "name": r["COMPANY NAME"], "side": side,
+                        "avg_weight": r["avg_w"], "formation_eom": str(peak.replace(day=1) - timedelta(days=1))})
+    return out
+
+
+def run_agent(cfg):
+    a = _agent_cfg(cfg)
+    out_dir, cache_dir = Path(cfg["output_dir"]), Path(cfg["cache_dir"])
+    cache_p = cache_dir / "agent_cache.json"
+    try:
+        cache = json.loads(cache_p.read_text(encoding="utf-8"))
+    except Exception:
+        cache = {}
+    rows = []
+    for h in _agent_pick(out_dir / "holdings.csv", a["top_n"]):
+        key = f"{h['permno']}|{h['formation_eom']}|{a['model']}"
+        if key not in cache:
+            try:
+                cache[key] = _agent_explain(cfg, h["permno"], h["formation_eom"], h["side"])
+            except Exception as e:
+                if _agent_conn_err(e):
+                    print(f"[agent] LLM endpoint unreachable ({type(e).__name__}); stopping agent run")
+                    break
+                print(f"[agent] {h['ticker']} failed: {e}")
+                continue
+        rows.append({**h, **cache[key]})
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_p.write_text(json.dumps(cache, default=str), encoding="utf-8")
+    kept = sum(len(r["facts"]) for r in rows)
+    drop = sum(len(r["dropped_facts"]) for r in rows)
+    summ = {"n_holdings": len(rows), "verification_rate": kept / (kept + drop) if kept + drop else None,
+            "verified_facts": kept, "dropped_facts": drop, "model": a["model"],
+            "timestamp": datetime.now().isoformat(timespec="seconds"), "note": _AGENT_NOTE}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "agent_rationales.json").write_text(
+        json.dumps({"summary": summ, "note": _AGENT_NOTE, "holdings": rows}, indent=2, default=str), encoding="utf-8")
+    print(f"[agent] {len(rows)} holdings explained; verified {kept}/{kept + drop} facts; model {a['model']}")
+    return rows
 
 
 # ===== src/pipeline.py =====
@@ -1556,15 +1907,19 @@ def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, rm,
 
 # ----------------------------------------------------------------------------- full run + step 11 / 12 helpers
 def _pipe_book(preds, frame, choice, cfg, rm, ic, spec=False):
-    """Main book: v2 (cfg["book"] == "v2": alpha = ic * xs_vol * z) or the spec book with the chosen lambdas (also forced by spec=True).
-    Logs the number of months with relaxed constraints. -> (weights, log)"""
+    """Main book cfg["book"]: "spec" (chosen lambdas), "v2" (alpha = ic * xs_vol * z) or "v3_s<smooth>" (sector-neutral tail book);
+    spec=True forces the spec book. Logs the number of months with relaxed constraints. -> (weights, log)"""
     sc = _pipe_scored(preds, frame, cfg, rm)
-    if cfg["book"] == "v2" and not spec:
+    book = "spec" if spec else cfg["book"]
+    if book == "v2":
         w, log = run_book_v2(sc, cfg, rm, ic)
+    elif book.startswith("v3_s"):
+        w, log = run_book_v3(sc, cfg, float(book[4:]))
     else:
+        book = "spec"
         w, log = run_book(sc, choice["lam_tc"], choice["lam_beta"], cfg, lam_risk=choice["lam_risk"], lam_fac=choice["lam_fac"], rm=rm)
     n_rel = sum(1 for r in log if isinstance(r, dict) and any(v for k, v in r.items() if "relax" in k))
-    _pipe_log(f"book {'spec' if spec or cfg['book'] != 'v2' else 'v2'}: {len(log)} months, {n_rel} with relaxed constraints")
+    _pipe_log(f"book {book}: {len(log)} months, {n_rel} with relaxed constraints")
     return w, log
 
 
@@ -1573,6 +1928,23 @@ def _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic=None, spec=Fa
     w, _ = _pipe_book(preds, frame, choice, cfg, rm, ic, spec)
     rets, n_miss = book_returns(w, frame, market, cfg)
     return w, rets, n_miss
+
+
+def _pipe_candidates(cfg):
+    return ["spec", "v2"] + [f"v3_s{x}" for x in cfg["v3_smooth_grid"]]
+
+
+def _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos):
+    """cfg["book"] == "auto": pick the candidate with the highest 2019-2020 validation IR (test stats are computed afterwards, for the
+    record only). Explicit cfg["book"] is kept. -> (cfg with the chosen book, book_selection dict)"""
+    ic_val, ic_test = _pipe_ic_map(infos, frame, cfg, val=True), _pipe_ic_map(infos, frame, cfg)
+    cands = _pipe_candidates(cfg) if cfg["book"] == "auto" else [cfg["book"]]
+    val = {c: _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, {**cfg, "book": c}, rm, ic_val)[1], cfg) for c in cands}
+    best = max(cands, key=lambda c: val[c]["ir"] if np.isfinite(val[c]["ir"]) else -np.inf)
+    cfg = {**cfg, "book": best}
+    test = {c: _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, {**cfg, "book": c}, rm, ic_test)[1], cfg) for c in cands}
+    _pipe_log("book selection (val IR/beta): " + ", ".join(f"{c} {val[c]['ir']:.3f}/{val[c]['beta']:.3f}" for c in cands) + f" -> {best}")
+    return cfg, {"rule": "highest 2019-2020 validation IR", "chosen": best, "validation": val, "test_for_transparency": test}
 
 
 def _pipe_leak_filings(filings, feats):
@@ -1693,6 +2065,7 @@ def main(cfg):
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
     ic_test = _pipe_ic_map(infos, frame, cfg)           # per test year: that window's validation IC (a pre-test quantity)
+    cfg, book_sel = _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos)
     weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic_test)
     _pipe_log(f"full book ({cfg['book']}): IR {_pipe_ir(rets):.3f}, missing returns {n_miss}")
     # comparison: spec book on the same test predictions; main book on 2019-2020 validation (a check, nothing tuned on it)
@@ -1705,7 +2078,7 @@ def main(cfg):
     write_submission(weights, frame, filings, rets, cfg)
     _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos,
                 "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
-                "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val},
+                "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel},
                "settings_log.json", cfg)
 
     # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
@@ -1731,6 +2104,11 @@ def main(cfg):
     assert not leak["target_like_features"], f"leakage: target-identical features: {leak['target_like_features']}"
     assert leak["duplicate_permno_eom"] == 0, "leakage: duplicate (permno, eom) keys"
     _pipe_log("pipeline complete")
+    if cfg.get("agent_enabled"):
+        try:
+            run_agent(cfg)
+        except Exception as e:
+            print(f"[agent] warning: explanation agent failed: {e}")
 
 
 if __name__ == "__main__":

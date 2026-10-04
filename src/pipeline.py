@@ -18,9 +18,10 @@ from src.text import event_flags, finbert_doc_tones, tone_features
 from src.kalman import kalman_betas
 from src.ranker import windows, fit_predict_year, run_schedule, rank_ic
 from src.risk import risk_model
-from src.optimizer import run_book, run_book_v2
+from src.optimizer import run_book, run_book_v2, run_book_v3
 from src.metrics import load_market, book_returns
 from src.report import performance_pack, write_submission
+from src.agent import run_agent
 
 _PIPE_T0 = time.time()
 _PIPE_KEYS = ["permno", "eom"]
@@ -308,15 +309,19 @@ def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, rm,
 
 # ----------------------------------------------------------------------------- full run + step 11 / 12 helpers
 def _pipe_book(preds, frame, choice, cfg, rm, ic, spec=False):
-    """Main book: v2 (cfg["book"] == "v2": alpha = ic * xs_vol * z) or the spec book with the chosen lambdas (also forced by spec=True).
-    Logs the number of months with relaxed constraints. -> (weights, log)"""
+    """Main book cfg["book"]: "spec" (chosen lambdas), "v2" (alpha = ic * xs_vol * z) or "v3_s<smooth>" (sector-neutral tail book);
+    spec=True forces the spec book. Logs the number of months with relaxed constraints. -> (weights, log)"""
     sc = _pipe_scored(preds, frame, cfg, rm)
-    if cfg["book"] == "v2" and not spec:
+    book = "spec" if spec else cfg["book"]
+    if book == "v2":
         w, log = run_book_v2(sc, cfg, rm, ic)
+    elif book.startswith("v3_s"):
+        w, log = run_book_v3(sc, cfg, float(book[4:]))
     else:
+        book = "spec"
         w, log = run_book(sc, choice["lam_tc"], choice["lam_beta"], cfg, lam_risk=choice["lam_risk"], lam_fac=choice["lam_fac"], rm=rm)
     n_rel = sum(1 for r in log if isinstance(r, dict) and any(v for k, v in r.items() if "relax" in k))
-    _pipe_log(f"book {'spec' if spec or cfg['book'] != 'v2' else 'v2'}: {len(log)} months, {n_rel} with relaxed constraints")
+    _pipe_log(f"book {book}: {len(log)} months, {n_rel} with relaxed constraints")
     return w, log
 
 
@@ -325,6 +330,23 @@ def _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic=None, spec=Fa
     w, _ = _pipe_book(preds, frame, choice, cfg, rm, ic, spec)
     rets, n_miss = book_returns(w, frame, market, cfg)
     return w, rets, n_miss
+
+
+def _pipe_candidates(cfg):
+    return ["spec", "v2"] + [f"v3_s{x}" for x in cfg["v3_smooth_grid"]]
+
+
+def _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos):
+    """cfg["book"] == "auto": pick the candidate with the highest 2019-2020 validation IR (test stats are computed afterwards, for the
+    record only). Explicit cfg["book"] is kept. -> (cfg with the chosen book, book_selection dict)"""
+    ic_val, ic_test = _pipe_ic_map(infos, frame, cfg, val=True), _pipe_ic_map(infos, frame, cfg)
+    cands = _pipe_candidates(cfg) if cfg["book"] == "auto" else [cfg["book"]]
+    val = {c: _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, {**cfg, "book": c}, rm, ic_val)[1], cfg) for c in cands}
+    best = max(cands, key=lambda c: val[c]["ir"] if np.isfinite(val[c]["ir"]) else -np.inf)
+    cfg = {**cfg, "book": best}
+    test = {c: _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, {**cfg, "book": c}, rm, ic_test)[1], cfg) for c in cands}
+    _pipe_log("book selection (val IR/beta): " + ", ".join(f"{c} {val[c]['ir']:.3f}/{val[c]['beta']:.3f}" for c in cands) + f" -> {best}")
+    return cfg, {"rule": "highest 2019-2020 validation IR", "chosen": best, "validation": val, "test_for_transparency": test}
 
 
 def _pipe_leak_filings(filings, feats):
@@ -445,6 +467,7 @@ def main(cfg):
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
     ic_test = _pipe_ic_map(infos, frame, cfg)           # per test year: that window's validation IC (a pre-test quantity)
+    cfg, book_sel = _pipe_select_book(val_2021, preds, frame, choice, market, cfg, rm, infos)
     weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic_test)
     _pipe_log(f"full book ({cfg['book']}): IR {_pipe_ir(rets):.3f}, missing returns {n_miss}")
     # comparison: spec book on the same test predictions; main book on 2019-2020 validation (a check, nothing tuned on it)
@@ -457,7 +480,7 @@ def main(cfg):
     write_submission(weights, frame, filings, rets, cfg)
     _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos,
                 "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
-                "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val},
+                "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel},
                "settings_log.json", cfg)
 
     # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
@@ -483,3 +506,8 @@ def main(cfg):
     assert not leak["target_like_features"], f"leakage: target-identical features: {leak['target_like_features']}"
     assert leak["duplicate_permno_eom"] == 0, "leakage: duplicate (permno, eom) keys"
     _pipe_log("pipeline complete")
+    if cfg.get("agent_enabled"):
+        try:
+            run_agent(cfg)
+        except Exception as e:
+            print(f"[agent] warning: explanation agent failed: {e}")

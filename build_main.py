@@ -2,7 +2,7 @@
 import ast
 from pathlib import Path
 
-MODULES = ["config", "data", "gru", "text", "kalman", "ranker", "risk", "optimizer", "metrics", "report", "pipeline"]
+MODULES = ["config", "data", "gru", "text", "kalman", "ranker", "risk", "optimizer", "metrics", "report", "agent", "pipeline"]
 
 
 def _strip_local_imports(text):

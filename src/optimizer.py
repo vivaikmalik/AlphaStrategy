@@ -214,3 +214,86 @@ def run_book_v2(scored, cfg, rm, ic):
         w_prev = w
     wdf = pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row")
     return wdf, log
+
+
+def _opt_cap(w, cap, total):
+    """Scale positive array w to sum `total`, cap each at `cap`, redistribute the excess to uncapped names. -> (w, capped?)"""
+    w = w / w.sum() * total
+    capped = False
+    for _ in range(50):
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        capped = True
+        w = np.where(over, cap, w)
+        free = ~over & (w < cap - 1e-12)
+        if not free.any() or total - w[~free].sum() <= 0:
+            break
+        w[free] *= (total - w[~free].sum()) / w[free].sum()
+    return w, capped
+
+
+def run_book_v3(scored, cfg, smooth):
+    """Sector-neutral equal-weight tail book on smoothed z-scores, beta-neutral legs. scored: permno, eom, score, short_eligible,
+    sector, beta_kf -> (weights df[permno, eom, weight], log list of dicts)."""
+    prev_s, w_prev, rows, log = {}, {}, [], []
+    for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
+        sc = mdf["score"].to_numpy().astype(float)
+        sc = np.where(np.isfinite(sc), sc, np.nan)
+        sd = np.nanstd(sc, ddof=1) if np.isfinite(sc).sum() > 1 else 0.0
+        z = np.nan_to_num((sc - np.nanmean(sc)) / sd) if sd > 0 else np.zeros(len(sc))
+        pm = mdf["permno"].to_list()
+        s = np.array([smooth * zi + (1 - smooth) * prev_s.get(p, zi) for p, zi in zip(pm, z)])
+        prev_s = dict(zip(pm, s))
+        beta = mdf["beta_kf"].to_numpy().astype(float)
+        beta = np.where(np.isfinite(beta), beta, np.nanmedian(beta) if np.isfinite(beta).any() else 1.0)
+        elig = mdf["short_eligible"].fill_null(False).to_numpy()
+        sec = np.array(mdf["sector"].fill_null("NA").cast(pl.Utf8).to_list())
+        tail = cfg["v3_tail"]
+        while True:                               # competition rule: <= 500 names -> shrink the tail until it fits
+            longs, shorts, budget = [], [], []    # per kept sector: index arrays + stock count
+            for sname in np.unique(sec):
+                idx = np.where(sec == sname)[0]
+                nl = int(np.ceil(tail * len(idx)))
+                top = idx[np.argsort(-s[idx], kind="stable")[:nl]]
+                cand = idx[elig[idx] & ~np.isin(idx, top)]
+                ns = int(np.ceil(tail * elig[idx].sum()))
+                bot = cand[np.argsort(s[cand], kind="stable")[:ns]]
+                if len(top) and len(bot):
+                    longs.append(top); shorts.append(bot); budget.append(len(idx))
+            if sum(len(x) for x in longs + shorts) <= 500 or tail <= 0.02:
+                break
+            tail -= 0.01
+        flags = []
+        if not longs:
+            log.append({"eom": eom, "n_long": 0, "n_short": 0, "gross": 0.0, "net": 0.0, "beta_exposure": 0.0, "turnover": sum(abs(x) for x in w_prev.values()), "flags": ["empty"]})
+            w_prev = {}
+            continue
+        budget = np.array(budget, float) / sum(budget)
+        li, si = np.concatenate(longs), np.concatenate(shorts)
+        lw = np.concatenate([np.full(len(a), b / len(a)) for a, b in zip(longs, budget)])
+        sw = np.concatenate([np.full(len(a), b / len(a)) for a, b in zip(shorts, budget)])
+        bl, bs = float(lw @ beta[li]), float(sw @ beta[si])
+        g = cfg["gross"]
+        L = g * bs / (bl + bs) if bl + bs > 1e-9 else g / 2
+        if abs(2 * L - g) > cfg["net_band"]:
+            L = (g + np.sign(2 * L - g) * cfg["net_band"]) / 2
+            flags.append("net_clipped")
+        S = g - L
+        lw, c1 = _opt_cap(lw, cfg["max_weight"], L)
+        sw, c2 = _opt_cap(sw, cfg["max_weight"], S)
+        if c1 or c2:
+            flags.append("max_weight_capped")
+        n_names = len(li) + len(si)
+        if n_names > 500:
+            flags.append("names_gt_500")
+            print(f"[optimizer-v3] {eom}: {n_names} names > 500")
+        w = {int(pm[i]): float(x) for i, x in zip(li, lw)}
+        w.update({int(pm[i]): -float(x) for i, x in zip(si, sw)})
+        turn = sum(abs(w.get(p, 0.0) - w_prev.get(p, 0.0)) for p in set(w) | set(w_prev))
+        log.append({"eom": eom, "n_long": len(li), "n_short": len(si), "gross": float(lw.sum() + sw.sum()), "net": float(lw.sum() - sw.sum()),
+                    "beta_exposure": float(lw @ beta[li] - sw @ beta[si]), "turnover": float(turn), "flags": flags})
+        rows += [(p, eom, x) for p, x in w.items()]
+        w_prev = w
+    wdf = pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row")
+    return wdf, log

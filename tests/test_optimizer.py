@@ -4,7 +4,7 @@ from datetime import date
 import numpy as np
 import polars as pl
 from src.config import CONFIG
-from src.optimizer import optimize_month, run_book
+from src.optimizer import optimize_month, run_book, run_book_v3
 
 CFG = dict(CONFIG)
 
@@ -199,3 +199,26 @@ def test_v2_vol_relaxed_and_run_book():
     rm = {"sectors": risk[0], "L": {date(2020, 1, 31): risk[1]}, "xs_vol": {date(2020, 1, 31): 0.1, date(2020, 2, 29): 0.1}}
     wdf, log = run_book_v2(pl.concat([m, m2]), cfg, rm, 0.05)
     assert wdf["eom"].n_unique() == 2 and len(log) == 2 and log[1]["vol"] is None
+
+
+def test_book_v3():
+    cfg = {**CFG, "v3_tail": 0.05}
+    ms = [_month(n=3000, seed=i, eom=date(2020, i + 1, 28)) for i in range(3)]
+    sc = pl.concat(ms)
+    w, log = run_book_v3(sc, cfg, 0.5)
+    for m, lg in zip(ms, log):
+        d = w.filter(pl.col("eom") == m["eom"][0]).join(m, on="permno")
+        ww, b = d["weight"].to_numpy(), d["beta_kf"].to_numpy()
+        assert abs(ww.sum() - lg["net"]) < 1e-9 and abs(np.abs(ww).sum() - 2) < 1e-6 and abs(ww.sum()) <= 0.2 + 1e-6
+        assert len(ww) <= 500
+        if "net_clipped" not in lg["flags"] and "max_weight_capped" not in lg["flags"]:
+            assert abs((ww * b).sum()) < 1e-6
+            L, S = ww[ww > 0].sum(), -ww[ww < 0].sum()
+            for sname, g in d.group_by("sector"):
+                budget = (m["sector"] == sname[0]).sum() / m.height
+                assert abs(g["weight"].sum() - (L - S) * budget) < 1e-6
+    # no look-ahead: changing the last month leaves earlier weights unchanged
+    sc2 = pl.concat(ms[:2] + [ms[2].with_columns(score=-pl.col("score"))])
+    w2, _ = run_book_v3(sc2, cfg, 0.5)
+    k = date(2020, 2, 28)
+    assert w.filter(pl.col("eom") <= k).sort(["eom", "permno"]).equals(w2.filter(pl.col("eom") <= k).sort(["eom", "permno"]))

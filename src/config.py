@@ -123,7 +123,11 @@ CONFIG = {
 
     # --- book v2 (not in spec; added after the first full runs). Every number is a stated assumption or
     #     estimated on pre-test data, nothing is searched. The spec book is still run and reported for comparison.
-    "book": "spec",                         # main book = higher 2019-2020 validation IR: spec 0.76 vs v2 0.38 -> spec
+    "book": "auto",                         # main book = highest 2019-2020 validation IR among spec / v2 / v3 variants
+    # v3 "classic" book (not in spec): smoothed score, top/bottom decile within each sector, equal weight,
+    # sector-neutral legs, leg sizes set for beta neutrality on beta_kf (net within net_band)
+    "v3_smooth_grid": [1.0, 0.5],           # EMA weight on the current month's z-score (1.0 = no smoothing)
+    "v3_tail": 0.10,                        # top / bottom fraction within each sector
     "v2_cost": 0.0012,                      # assumed one-way trading cost (12 bps) per unit of |trade|
     "v2_vol_target": 0.08,                  # ex-ante annual volatility cap (factor + specific risk)
     "v2_max_weight": 0.005,                 # 0.5% per name -> ~400-500 names at 200% gross (rules allow 500)
@@ -131,6 +135,15 @@ CONFIG = {
     "v2_ic_floor": 0.01,                    # IC used to scale alpha = IC * xs_vol * z (each window's validation IC)
     "risk_spec_window": 36,                 # trailing months of residuals for specific variance
     "risk_spec_min": 6,
+
+    # --- analyst agent (spec step A, lite): explains top holdings; never feeds signal or weights ---
+    "agent_enabled": True,                  # skipped with a warning if the LLM server is unreachable
+    "agent_url": "http://localhost:11434/v1/chat/completions",   # Ollama OpenAI-compatible endpoint on the GX10
+    "agent_model": "gpt-oss:20b",
+    "agent_max_steps": 4,
+    "agent_top_n": 10,
+    "agent_max_filings": 5,
+    "agent_max_chars": 6000,
 
     # --- step 10 grids (fixed once on 2019-2020, then frozen) ---
     "gru_d_grid": [8, 16, 32],
