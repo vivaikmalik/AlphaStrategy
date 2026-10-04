@@ -351,7 +351,9 @@ def _pipe_v4_tune(vals_by_year, frame, panel, market, cfg, v4rets):
         res = Parallel(n_jobs=cfg["n_jobs"], backend="loky")(delayed(_pipe_v4_job)(sc, p, fr, market, vr, cfg) for p in cfgs)
         log[y] = [{**p, "net_ir": r[0], "gross_ir": r[1], "turnover": r[2]} for p, r in zip(cfgs, res)]
         ok = [(r[0], i) for i, r in enumerate(res) if np.isfinite(r[0])]
-        params[y] = cfgs[max(ok)[1]] if ok else cfgs[0]
+        # all configs disqualified (incomplete books): keep last year's choice, else the most risk-averse full-gross config
+        fallback = params[max(params)] if params else max(cfgs, key=lambda p: (p["gross"], p["risk_penalty"], p["turnover_penalty"]))
+        params[y] = cfgs[max(ok)[1]] if ok else fallback
         _pipe_log(f"v4 tuning {y}: {params[y]} net IR {max(ok)[0] if ok else float('nan'):.3f}")
     return params, log
 
