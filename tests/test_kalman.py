@@ -53,3 +53,12 @@ def test_missing_months_widen_variance_and_fallback():
     blank = df.filter(pl.col("permno") == pid).with_columns([pl.lit(None, pl.Float64).alias(c) for c in OBS])
     out, _ = kalman_betas(pl.concat([df.filter(pl.col("permno") != pid), blank]), CFG)
     assert out.filter(pl.col("permno") == pid)["beta_kf"].null_count() == 0
+
+
+def test_r_floor_bounds_R_and_none_is_unchanged():
+    df, _ = _sim(n=100, T=48)
+    _, p0 = kalman_betas(df, CFG)
+    _, pn = kalman_betas(df, CFG, r_floor=None)
+    assert p0["R"] == pn["R"] and p0["phi"] == pn["phi"] and p0["q"] == pn["q"] and pn["r_floor"] is None
+    _, pf = kalman_betas(df, CFG, r_floor=0.05)
+    assert pf["r_floor"] == 0.05 and all(r >= 0.05 - 1e-9 for r in pf["R"].values())

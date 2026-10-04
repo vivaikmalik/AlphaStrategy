@@ -106,6 +106,14 @@ CONFIG = {
     "sector_band": 0.10,
     "max_weight": 0.015,
 
+    # --- additions after the first full run (not in spec; chosen on 2019-2020 only) ---
+    "size_band": 0.05,                      # |sum size_z * w| <= band; size_z = monthly z-score of log(me_raw)
+    "lambda_risk_grid": [0.0, 30.0, 100.0, 300.0],   # L2 risk penalty lam_risk * sum(w^2) (Sharpe proxy)
+    "kalman_r_floor": 0.05,                 # variant "kf_rfloor": lower bound on every R_j
+    "beta_shrink": 0.33,                    # variant "b60_shrunk": (1-0.33)*beta_60m + 0.33*1
+    "beta_variants": ["kf", "kf_rfloor", "b60_shrunk"],
+    "beta_check_t": 1.96,                   # step 10 beta check: |t| above this = clearly nonzero -> fix betas
+
     # --- step 10 grids (fixed once on 2019-2020, then frozen) ---
     "gru_d_grid": [8, 16, 32],
     "lambda_tc_grid": [0.0, 0.1, 0.25, 0.5],

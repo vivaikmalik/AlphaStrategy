@@ -110,8 +110,10 @@ def _pipe_attach_target(preds, frame):
 
 
 def _pipe_scored(preds, frame):
-    """Predictions + optimizer inputs (short_eligible, betas, sector)."""
-    cols = _PIPE_KEYS + ["short_eligible", "beta_kf", "beta_var", "sector"]
+    """Predictions + optimizer inputs (short_eligible, betas, sector, size_z = within-month z of log market cap)."""
+    lm = pl.when(pl.col("me_raw") > 0).then(pl.col("me_raw").log())
+    size_z = ((lm - lm.mean().over("eom")) / lm.std().over("eom")).fill_nan(None).fill_null(0.0).alias("size_z")
+    cols = _PIPE_KEYS + ["short_eligible", "beta_kf", "beta_var", "sector", size_z]
     return preds.select(_PIPE_KEYS + ["score"]).join(frame.select(cols), on=_PIPE_KEYS, how="left")
 
 
@@ -193,52 +195,95 @@ def _pipe_frame(df, emb, q, cfg):
 
 
 # ----------------------------------------------------------------------------- step 10 tuning
-def _pipe_book_job(scored, ltc, lb, cfg):
+def _pipe_book_job(scored, ltc, lb, lr, cfg):
     """Worker: one optimizer run over all months of `scored`."""
-    return run_book(scored, ltc, lb, cfg)
+    return run_book(scored, ltc, lb, cfg, lam_risk=lr)
 
 
-def _pipe_tune(frames, feats, market, cfg):
-    """Step 10: XGB on the 2021 window per d, then grid over (lam_tc, lam_beta, short_me_q) by validation IR."""
+def _pipe_tune(frames, feats, market, cfg, vals=None):
+    """Step 10: XGB on the 2021 window per d (skipped if `vals` given), then grid over
+    (lam_tc, lam_beta, short_me_q, lam_risk) by validation IR. Validation months only. -> (choice, grid, rets, vals)"""
     win = windows(cfg)[0]
-    vals, tasks = {}, []
+    fit, vals, tasks = vals is None, dict(vals or {}), []
     for d in cfg["gru_d_grid"]:
-        fr = frames[d]
-        fr = fr.filter(pl.col("target_month") <= win["test"][1])
-        _, val_pred, info = fit_predict_year(fr, feats[d], win, cfg)
-        vals[d] = val_pred
-        _pipe_log(f"tune: d={d} xgb val IC {info.get('val_ic')}")
+        fr = frames[d].filter(pl.col("target_month") <= win["test"][1])
+        if fit:
+            _, vals[d], info = fit_predict_year(fr, feats[d], win, cfg)
+            _pipe_log(f"tune: d={d} xgb val IC {info.get('val_ic')}")
         for q in cfg["short_me_q_grid"]:
-            sc = _pipe_scored(val_pred, _pipe_with_short(fr, q, cfg))
-            tasks += [(d, ltc, lb, q, sc) for ltc in cfg["lambda_tc_grid"] for lb in cfg["lambda_beta_grid"]]
+            sc = _pipe_scored(vals[d], _pipe_with_short(fr, q, cfg))
+            tasks += [(d, ltc, lb, q, lr, sc) for ltc in cfg["lambda_tc_grid"] for lb in cfg["lambda_beta_grid"]
+                      for lr in cfg["lambda_risk_grid"]]
     _pipe_log(f"tune: {len(tasks)} optimizer runs on {cfg['n_jobs']} workers")
     res = Parallel(n_jobs=cfg["n_jobs"], backend="loky")(
-        delayed(_pipe_book_job)(sc, ltc, lb, cfg) for d, ltc, lb, q, sc in tasks)
+        delayed(_pipe_book_job)(sc, ltc, lb, lr, cfg) for d, ltc, lb, q, lr, sc in tasks)
     grid, best = [], None
-    for (d, ltc, lb, q, _), (w, log) in zip(tasks, res):
+    for (d, ltc, lb, q, lr, _), (w, log) in zip(tasks, res):
         rets, _ = book_returns(w, frames[d], market, cfg)
         ir = _pipe_ir(rets)
-        grid.append({"d": d, "lam_tc": ltc, "lam_beta": lb, "short_me_q": q, "val_ir": ir,
+        grid.append({"d": d, "lam_tc": ltc, "lam_beta": lb, "short_me_q": q, "lam_risk": lr, "val_ir": ir,
                      "n_relaxed_months": sum(1 for r in log if (r.get("beta_tol") or 0) > cfg["beta_tol"] + 1e-12)})
         if np.isfinite(ir) and (best is None or ir > best[0]):
             best = (ir, grid[-1], rets)
-    choice = {k: best[1][k] for k in ["d", "lam_tc", "lam_beta", "short_me_q"]} | {"val_ir": best[0]}
-    return choice, grid, best[2]
+    choice = {k: best[1][k] for k in ["d", "lam_tc", "lam_beta", "short_me_q", "lam_risk"]} | {"val_ir": best[0]}
+    return choice, grid, best[2], vals
 
 
 def _pipe_beta_check(rets, cfg):
-    """Chosen validation book vs S&P: loud warning when |beta| > 0.2 and significant."""
+    """Chosen validation book vs S&P: beta is clearly nonzero (warning) when |t| > beta_check_t."""
     b = _pipe_beta(rets, cfg)
-    b["warning"] = bool(abs(b["beta"]) > 0.2 and abs(b["t"]) > 1.96)
+    b["warning"] = bool(abs(b["t"]) > cfg["beta_check_t"])
     if b["warning"]:
-        print(f"WARNING: validation book beta to S&P = {b['beta']:.3f} (t={b['t']:.2f}) is large and significant", flush=True)
+        print(f"WARNING: validation book beta to S&P = {b['beta']:.3f} (t={b['t']:.2f}) is clearly nonzero", flush=True)
     return b
+
+
+def _pipe_beta_variant(name, df, panel, cfg, logs):
+    """Beta estimates [permno, eom, beta_kf, beta_var] for one variant (kf_rfloor is cached)."""
+    kf = df.select(_PIPE_KEYS + ["beta_kf", "beta_var"])
+    if name == "kf":
+        return kf
+    if name == "kf_rfloor":
+        def build():
+            return kalman_betas(panel, cfg, r_floor=cfg["kalman_r_floor"])
+        out, logs["kalman_rfloor"] = _pipe_cached_info(_pipe_path(cfg, "kalman_rfloor.parquet"), build)
+        return df.select(_PIPE_KEYS).join(out, on=_PIPE_KEYS, how="left")
+    k, b = cfg["beta_shrink"], pl.col("beta_60m")          # b60_shrunk; raw beta_60m clipped at its 1st/99th pct (raw reaches +/-1e4)
+    fit = panel.filter(pl.col("eom") <= date.fromisoformat(cfg["kalman_fit_end_eom"]))["beta_60m"]   # pre-2019 only
+    lo, hi = fit.quantile(0.01), fit.quantile(0.99)
+    raw = panel.select(_PIPE_KEYS + [b.clip(lo, hi).alias("beta_60m")])
+    return kf.join(raw, on=_PIPE_KEYS, how="left").with_columns(
+        beta_kf=pl.when(b.is_not_null()).then((1 - k) * b + k).otherwise(pl.col("beta_kf"))).drop("beta_60m")
+
+
+def _pipe_swap_beta(frames, bv):
+    return {d: fr.drop(["beta_kf", "beta_var"]).join(bv, on=_PIPE_KEYS, how="left") for d, fr in frames.items()}
+
+
+def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, logs):
+    """Step 10 beta fix: validation beta of each variant at the current choice; if the best is not "kf", redo the grid.
+    -> (frames, choice, grid, check, log); grid is None when "kf" is kept."""
+    fix, swapped = {"variants": {}, "choice_kf": choice, "check_kf": chk}, {}
+    for name in cfg["beta_variants"]:
+        swapped[name] = _pipe_swap_beta(frames, _pipe_beta_variant(name, df, panel, cfg, logs))
+        fr = _pipe_with_short(swapped[name][choice["d"]], choice["short_me_q"], cfg)
+        v = fix["variants"][name] = _pipe_beta(_pipe_run_book_stats(vals[choice["d"]], fr, choice, market, cfg)[1], cfg)
+        _pipe_log(f"beta fix: {name} val beta {v['beta']:.3f} (t={v['t']:.2f})")
+    best = min(fix["variants"], key=lambda n: abs(fix["variants"][n]["beta"]) if np.isfinite(fix["variants"][n]["beta"]) else np.inf)
+    fix["chosen"], grid = best, None
+    if best != "kf":
+        frames = swapped[best]
+        choice, grid, rets, _ = _pipe_tune(frames, feats, market, cfg, vals)
+        chk = _pipe_beta_check(rets, cfg)
+        fix |= {"choice_final": choice, "check_final": chk}
+    _pipe_log(f"beta fix: variant {best}; val beta {chk['beta']:.3f} (t={chk['t']:.2f}); choice {choice}")
+    return frames, choice, grid, chk, fix
 
 
 # ----------------------------------------------------------------------------- full run + step 11 / 12 helpers
 def _pipe_run_book_stats(preds, frame, choice, market, cfg):
     """Book with chosen lambdas on test predictions -> (weights, rets, IR, beta)."""
-    w, _ = run_book(_pipe_scored(preds, frame), choice["lam_tc"], choice["lam_beta"], cfg)
+    w, _ = run_book(_pipe_scored(preds, frame), choice["lam_tc"], choice["lam_beta"], cfg, lam_risk=choice["lam_risk"])
     rets, n_miss = book_returns(w, frame, market, cfg)
     return w, rets, n_miss
 
@@ -340,13 +385,17 @@ def main(cfg):
     frames = {d: _pipe_frame(df, embs[d], cfg["short_me_q"], cfg) for d in cfg["gru_d_grid"]}
 
     # step 10: tuning on 2019-2020 validation
-    choice, grid, val_rets = _pipe_tune(frames, feats, market, cfg)
-    beta_chk = _pipe_beta_check(val_rets, cfg)
+    choice, grid, val_rets, vals = _pipe_tune(frames, feats, market, cfg)
+    beta_chk, beta_fix = _pipe_beta_check(val_rets, cfg), None
+    if beta_chk["warning"]:
+        frames, choice, grid2, beta_chk, beta_fix = _pipe_beta_fix(df, panel, frames, feats, vals, choice, beta_chk, market, cfg, logs)
+        if grid2:
+            beta_fix["grid_kf"], grid = grid, grid2
     _pipe_log(f"step 10 choice {choice}; validation beta {beta_chk}")
     d = choice["d"]
     frame = _pipe_with_short(frames[d], choice["short_me_q"], cfg)
     full = feats[d]
-    _pipe_dump({"choice": choice, "beta_check": beta_chk, "grid": grid, "logs": logs}, "settings_log.json", cfg)
+    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs}, "settings_log.json", cfg)
 
     # step 5 + 9: full schedule, predictions, book, performance, submission
     preds, val_2021, infos = run_schedule(frame, full, cfg)
@@ -356,7 +405,7 @@ def main(cfg):
     _pipe_log(f"full book: IR {_pipe_ir(rets):.3f}, missing returns {n_miss}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
-    _pipe_dump({"choice": choice, "beta_check": beta_chk, "grid": grid, "logs": logs, "xgb_infos": infos,
+    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos,
                 "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg)},
                "settings_log.json", cfg)
 

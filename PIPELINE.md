@@ -73,7 +73,7 @@ Conventions that hold everywhere:
 
 ### 2.6 Step-10 tuning on 2019-2020 (step 10) - `pipeline._pipe_tune`
 
-Detailed in section 4. In short: for each d, fit the XGBoost ranker for the 2021 window (train through 2018-12, validate on 2019-2020), build the validation book for every combination of `lambda_tc`, `lambda_beta`, short-eligible ME percentile, and pick the combination with the highest 2019-2020 IR. The choice is then frozen for all test years. Then `_pipe_beta_check` regresses the chosen validation book on the S&P 500 and prints a warning if `|beta| > 0.2` with `|t| > 1.96`. It writes `output/settings_log.json` (choice, beta check, full grid, GRU logs).
+Detailed in section 4. In short: for each d, fit the XGBoost ranker for the 2021 window (train through 2018-12, validate on 2019-2020), build the validation book for every combination of `lambda_tc`, `lambda_beta`, short-eligible ME percentile, `lambda_risk`, and pick the combination with the highest 2019-2020 IR. Then `_pipe_beta_check` regresses the chosen validation book on the S&P 500; if `|t| > beta_check_t` (1.96) the beta is clearly nonzero and the beta variants are tried (section 4). The final choice is frozen for all test years. It writes `output/settings_log.json` (choice, beta check, beta fix, full grid, GRU logs).
 
 ### 2.7 Main walk-forward run (steps 5, 9, 13, 14)
 
@@ -90,8 +90,8 @@ Detailed in section 4. In short: for each d, fit the XGBoost ranker for the 2021
 - Book (`optimizer.run_book`): one convex problem per month, solved with CVXPY/Clarabel:
   - Candidates: the top 250 stocks by score in the universe (longs) and the bottom 250 by score among short-eligible stocks (shorts). Scores are standardised within the month.
   - Variables `wL >= 0` (long candidates), `wS >= 0` (short candidates); `w = wL - wS`.
-  - Objective: maximise `s.w - lambda_tc * |w - w_prev|_1 - lambda_beta * sum(beta_var_i * w_i^2)`. Names that left the candidate set count as sold to 0 (a constant in the objective).
-  - Constraints: `sum(wL) + sum(wS) = 2`; `|sum(w)| <= 0.20`; `|beta_kf . w| <= tol` with `tol = 0.02`; every sector's net exposure within +/-0.10; every weight `<= 0.015`. If the problem is infeasible, `tol` rises by 0.01 until it solves (logged per month; counted in the tuning grid as `n_relaxed_months`).
+  - Objective: maximise `s.w - lambda_tc * |w - w_prev|_1 - lambda_beta * sum(beta_var_i * w_i^2) - lambda_risk * sum(w_i^2)`. Names that left the candidate set count as sold to 0 (a constant in the objective).
+  - Constraints: `sum(wL) + sum(wS) = 2`; `|sum(w)| <= 0.20`; `|beta_kf . w| <= tol` with `tol = 0.02`; every sector's net exposure within +/-0.10; every weight `<= 0.015`; size neutrality `|sum(size_z_i * w_i)| <= size_band` (0.05; `size_z` = within-month z-score of log market cap, null -> 0). If the problem is infeasible, `tol` rises by 0.01 until it solves (logged per month; counted in the tuning grid as `n_relaxed_months`).
   - With the 0.015 cap and net within +/-0.20, each side holds at least 0.9 of capital, so at least 60 names per side (120 total), and at most 500.
   - The first month of every book starts from cash (`w_prev = 0`); the book is built separately for validation, test, ablations and the shuffled run.
   - Why these constraints: they are the competition rules plus the spec's neutrality targets. Sector and beta constraints are what make the book market-neutral rather than a disguised sector or market bet. The `lambda_tc` term lowers turnover. The `lambda_beta` term pushes weight away from stocks whose beta is poorly measured.
@@ -125,7 +125,7 @@ Training and validation rows need a non-missing target; test rows do not. The te
 
 ## 4. What is tuned and what is tested
 
-Nothing global is chosen with 2021-2026 results. The global settings (d, `lambda_tc`, `lambda_beta`, short-eligible ME percentile) are chosen on the 2019-2020 validation period. The only items that use data after 2020 are the per-window XGBoost depth/trees and ridge alpha, and each of those is chosen on validation months that lie strictly before that test year.
+Nothing global is chosen with 2021-2026 results. The global settings (d, `lambda_tc`, `lambda_beta`, short-eligible ME percentile, `lambda_risk`, beta variant) are chosen on the 2019-2020 validation period. The only items that use data after 2020 are the per-window XGBoost depth/trees and ridge alpha, and each of those is chosen on validation months that lie strictly before that test year.
 
 | Search | Where | Grid | Chosen by | Frozen? |
 |---|---|---|---|---|
@@ -133,19 +133,19 @@ Nothing global is chosen with 2021-2026 results. The global settings (d, `lambda
 | GRU epochs | `gru.py` | up to 100, patience 5 | 2019-2020 reconstruction loss | Yes |
 | Kalman `phi, q, R_j` | `kalman.py` | continuous (L-BFGS-B MLE) | likelihood on `eom <= 2018-12` | Yes |
 | XGB depth x trees, per window | `ranker.py` | depth {3,4,5} x trees {50, 100, ..., 2000} (3 x 40 = 120 points per window) | mean monthly rank IC on that window's validation months | Per window, then refit on train + val |
-| d x `lambda_tc` x `lambda_beta` x short-eligible ME percentile | `pipeline._pipe_tune` | d {8,16,32} x `lambda_tc` {0, 0.1, 0.25, 0.5} x `lambda_beta` {0, 10, 100, 1000} x ME percentile {0.30, 0.40, 0.50} = 144 combinations | 2019-2020 validation IR of the book | Yes, for all test years and all ablations |
+| d x `lambda_tc` x `lambda_beta` x short-eligible ME percentile x `lambda_risk` | `pipeline._pipe_tune` | d {8,16,32} x `lambda_tc` {0, 0.1, 0.25, 0.5} x `lambda_beta` {0, 10, 100, 1000} x ME percentile {0.30, 0.40, 0.50} x `lambda_risk` {0, 30, 100, 300} = 576 combinations (rerun once if the beta variant changes) | 2019-2020 validation IR of the book | Yes, for all test years and all ablations |
 | Ridge alpha (ablation 1 only), per window | `ranker.py` | {0.1, 1, 10, 100, 1000, 10000} | validation mean monthly rank IC | Per window |
 
 Notes on the step-10 grid:
 
-- The XGBoost ranker is fitted once per d on the 2021 window (train-only fit; the validation predictions of that fit drive the books). It does not depend on `lambda_tc`, `lambda_beta` or the ME percentile, so those 48 combinations per d reuse the same predictions. The ME percentile changes only which stocks are short-eligible.
-- The 144 books run in parallel (`n_jobs = 16`, loky). The IR used is `sqrt(12) * mean(active) / std(active)` over the 24 validation months.
+- The XGBoost ranker is fitted once per d on the 2021 window (train-only fit; the validation predictions of that fit drive the books). It does not depend on `lambda_tc`, `lambda_beta` or the ME percentile, so those 192 combinations per d reuse the same predictions. The ME percentile changes only which stocks are short-eligible.
+- The 576 books run in parallel (`n_jobs = 16`, loky). The IR used is `sqrt(12) * mean(active) / std(active)` over the 24 validation months.
 - The validation scores used here come from a model whose depth/trees were themselves picked on the same 2019-2020 months by IC. The validation IR is therefore optimistic. That only affects the choice, not the test period.
 - `settings_log.json` stores every combination's `val_ir` and number of beta-relaxed months.
 
 Tests and checks:
 
-- Beta check (before the main run): OLS of the chosen validation book's monthly excess return on the S&P 500 excess return (Newey-West, 3 lags). It prints a warning if `|beta| > 0.2` and `|t| > 1.96`. It only warns: it does not stop the run or change the betas.
+- Beta check (before the main run): OLS of the chosen validation book's monthly excess return on the S&P 500 excess return (Newey-West, 3 lags). Beta is clearly nonzero if `|t| > beta_check_t` (1.96). Then, before touching 2021-2026, `_pipe_beta_fix` builds three beta variants (`kf` = the Kalman betas; `kf_rfloor` = Kalman refit with every `R_j >= kalman_r_floor`, cached as `kalman_rfloor.parquet`; `b60_shrunk` = `(1 - beta_shrink) * beta_60m + beta_shrink * 1` from the raw panel, clipped at its 1st/99th percentile, `kf` where missing, `beta_var` from `kf`), runs the validation book with the current choice under each, and keeps the variant with the smallest `|beta|`. If that is not `kf`, the step-10 grid is rerun with it and the beta check repeated. Everything (each variant's validation beta and t, chosen variant, both choices) is in `settings_log.json` under `beta_fix`. Only validation months (2018-12 to 2020-11) are used.
 - Structural leakage checks (`leakage_tests.json`, then asserted):
   - Every feature row flagged `has_filing = 1` has a filing in that calendar month, and no filing date is after its `eom`. (Filings are assigned to the month of their `filing_date`, so this holds by construction; the check guards against a later code change.)
   - Window ordering: train end < validation start <= validation end < test start, and train/validation end before the test year.
@@ -203,7 +203,7 @@ Is there an LLM agent reading the 8-Ks? No. The pipeline uses only item-code fla
 | `performance.json` | `performance_pack` | Deck. Summary statistics: IR, Sharpe, arithmetic and geometric returns, calendar years, legs, drawdown, alpha/beta vs the S&P 500 (Newey-West, 3 lags), correlation, holdings counts, gross/net/turnover (average, min, max), largest weight, top-10 share, short-book market cap/dollar volume/small-cap share, top and bottom 10 contributors, OOS R-squared of `ret_hat`. |
 | `figures/*.png` | `performance_pack` | Deck. `cumulative_returns`, `underwater` (drawdown), `rolling_active_return`, `rolling_ir`, `rolling_beta`, `return_histogram` (hurdle marked), `contributors`. Titles say "gross of trading costs". |
 | `predictions.parquet` | `main` | Audit. `permno, eom, score, ret_hat` for all test months. |
-| `settings_log.json` | `main` (written twice) | Audit. Step-10 choice, beta check, all 144 grid results, GRU logs, per-window XGBoost info (best depth/trees, validation IC, full IC grid), test IC/IR/beta. |
+| `settings_log.json` | `main` (written twice) | Audit. Step-10 choice, beta check, beta fix, all grid results, GRU logs, per-window XGBoost info (best depth/trees, validation IC, full IC grid), test IC/IR/beta. |
 | `ablations.json` | `_pipe_ablations` | Audit and deck. Section 5. |
 | `leakage_tests.json` | `_pipe_leakage` | Audit. Section 4. |
 
@@ -221,7 +221,8 @@ Each item below was checked in the code.
 5. Missing-value flags enter the model at ablation 3 together with the GRU; ablation 2 uses the 147 features without flags (section 5).
 6. `hist_*` counts are 0 (not NaN) for stock-months with no filings in the trailing window, defined for every stock-month. `has_filing = 0` rows keep `n_filings`, `item_*` and tone as NaN.
 7. The shuffled-label IC is a noise baseline and only a warning (section 4). The spec says test IC and IR "must be close to 0"; the code prints a warning at |IC| >= 0.01 or |IR| >= 1 but never fails on it.
-8. The beta check warns only. The spec says to fix the beta estimates before touching 2021-2026 if beta is clearly nonzero; the code runs on regardless, in one execution, so a warning needs a human to act on it and rerun.
+8. The beta check now acts, as the spec requires: if validation beta is clearly nonzero, the beta variants are compared and the step-10 grid rerun with the best (section 4). If no variant brings `|t|` under the threshold, the run still proceeds with the smallest-`|beta|` variant and a printed warning.
+8b. Additions made after the first full run, all chosen or fixed on 2019-2020 only: (a) the validation beta check failed (spec-mandated fix, item 8); (b) a size-neutrality constraint `|sum size_z * w| <= size_band`, because the short universe was structurally lopsided (shorts must be large and liquid); (c) an L2 risk penalty `lambda_risk * sum(w^2)` as a fifth grid dimension, because the linear objective piled names at the 1.5% cap.
 9. The S&P 500 note. Spec step 13 assumes the FRED S&P 500 series, a price index without dividends. The supplied `SP500.csv` is a total return series instead (its `sp500_source` column is `sp500tr_total_return`), so `performance.json` correctly states "S&P 500 series is the total return index from SP500.csv". Say the same in the deck.
 10. Rank IC and ICIR are computed on all rows with a non-null target (test rows with null targets are dropped). Months with no usable target are skipped.
 11. Missing flag cut-off. The 20% missing threshold is computed on universe rows with `target_month <= 2018-12-31`, a date hard-coded in `data.preprocess`.
@@ -259,6 +260,7 @@ Caching: `_pipe_cached` loads a parquet file if it exists and otherwise computes
 |---|---|---|
 | `universe.parquet` | filtered, ranked panel with `_miss` flags, `short_eligible`, `sector` | `min_abs_prc`, `universe_me_q`, `missing_flag_threshold`, short-eligible thresholds, the input data. Then also delete `gru_d*.parquet` and `text_features.parquet` (they are built on the universe rows) |
 | `kalman.parquet` + `kalman.json` | `beta_kf`, `beta_var` and fitted parameters | `kalman_obs`, `kalman_fit_end_eom`, the Kalman code |
+| `kalman_rfloor.parquet` + `.json` | beta variant `kf_rfloor` (only built if the beta check fails) | `kalman_r_floor`, the Kalman code |
 | `finbert_docs.parquet` | per-filing tone, keyed by `document_id` | the FinBERT model, chunking, or anonymisation code (cached tones are reused as they are) |
 | `text_features.parquet` | event flags + stock-month tone features | `items_flag`, `items_hist`, tone aggregation, the universe, or after deleting `finbert_docs.parquet` |
 | `gru_d8/16/32.parquet` + `.json` | embeddings and chosen weight decay | `gru_*` settings, `gru_d_grid`, the universe or factor list |

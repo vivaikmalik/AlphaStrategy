@@ -9,12 +9,13 @@ from src.optimizer import optimize_month, run_book
 CFG = dict(CONFIG)
 
 
-def _month(n=1500, seed=0, eom=date(2020, 1, 31), beta_spread=0.3):
+def _month(n=1500, seed=0, eom=date(2020, 1, 31), beta_spread=0.3, size=False):
     r = np.random.default_rng(seed)
-    return pl.DataFrame({
+    df = pl.DataFrame({
         "permno": np.arange(n, dtype=np.int64) + 1, "eom": pl.Series([eom] * n, dtype=pl.Date), "score": r.normal(size=n),
         "short_eligible": r.random(n) < 0.6, "beta_kf": 1 + beta_spread * r.normal(size=n),
         "beta_var": r.uniform(0.005, 0.05, n), "sector": [str(10 + x) for x in r.integers(0, 11, n)]})
+    return df.with_columns(size_z=pl.Series(r.normal(size=n))) if size else df   # size_z only when asked (old tests)
 
 
 def _check(mdf, w, info, tol=CFG["beta_tol"]):
@@ -101,3 +102,21 @@ def test_garbage_previous_weight_does_not_poison_month():
     w2, info = optimize_month(m, bad, 0.0, 1000.0, CFG)
     assert info["status"] in ("optimal", "optimal_inaccurate") and info["sector_band"] == CFG["sector_band"]
     _check(m, w2, info)
+
+
+def test_size_neutrality_constraint():
+    m = _month(seed=7, size=True)
+    w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
+    _check(m, w, info)
+    d = m.filter(pl.col("permno").is_in(list(w))).sort("permno")
+    assert abs(sum(z * w[p] for p, z in zip(d["permno"], d["size_z"]))) <= CFG["size_band"] + 1e-6
+    assert info["size_band"] >= CFG["size_band"]
+
+
+def test_lam_risk_spreads_weights():
+    m = _month(seed=8)
+    w0, i0 = optimize_month(m, {}, 0.0, 0.0, CFG)
+    w1, i1 = optimize_month(m, {}, 0.0, 0.0, CFG, lam_risk=100.0)
+    _check(m, w1, i1)
+    assert len(w1) >= len(w0) and max(abs(x) for x in w1.values()) <= max(abs(x) for x in w0.values()) + 1e-9
+    assert len(w1) > len(w0) or max(abs(x) for x in w1.values()) < max(abs(x) for x in w0.values())

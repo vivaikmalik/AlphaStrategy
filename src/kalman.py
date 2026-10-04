@@ -72,19 +72,26 @@ def _kalman_filter(Y, m, first, theta, t_end=None, full=False):
     return (ll, out) if full else ll
 
 
-def kalman_betas(panel, cfg):
-    """-> (DataFrame[permno, eom, beta_kf, beta_var], params). Panel = raw (unranked) betas."""
+def kalman_betas(panel, cfg, r_floor=None):
+    """-> (DataFrame[permno, eom, beta_kf, beta_var], params). Panel = raw (unranked) betas.
+    r_floor: optional lower bound on every observation noise variance R_j (None = unconstrained MLE)."""
     permnos, months, Y, m, first, pi, ti = _kalman_grid(panel, cfg)
     J = Y.shape[2]
     t_fit = int((months <= date.fromisoformat(cfg["kalman_fit_end_eom"])).sum())
     lo, hi = np.nanpercentile(Y[:, :t_fit], 1, axis=(0, 1)), np.nanpercentile(Y[:, :t_fit], 99, axis=(0, 1))
     Y = np.clip(Y, lo, hi)                       # winsorise at the fit-sample 1/99 pct: raw betas have +-1e4 outliers (not in spec)
     x0 = np.array([2.0, np.log(0.02)] + [np.log(0.05)] * J)
+    # R floor (not in spec): unconstrained MLE drives R(betabab_1260d) to its lower bound, so beta_kf copies that
+    # 5-year shrunk beta; the step-10 beta check found the validation book's realised beta clearly nonzero.
+    r_lo = -12 if r_floor is None else float(np.log(r_floor))
+    if r_floor is not None:
+        x0[2:] = np.maximum(x0[2:], r_lo)
     res = minimize(lambda th: -_kalman_filter(Y, m, first, th, t_fit), x0, method="L-BFGS-B",
-                   bounds=[(-8, 8)] + [(-12, 3)] * (J + 1))
+                   bounds=[(-8, 8), (-12, 3)] + [(r_lo, 3)] * J)
     th = res.x
     params = {"phi": float(1 / (1 + np.exp(-th[0]))), "q": float(np.exp(th[1])),
-              "R": {c: float(np.exp(r)) for c, r in zip(cfg["kalman_obs"], th[2:])}, "loglik": float(-res.fun)}
+              "R": {c: float(np.exp(r)) for c, r in zip(cfg["kalman_obs"], th[2:])}, "loglik": float(-res.fun),
+              "r_floor": r_floor}
     _, out = _kalman_filter(Y, m, first, th, full=True)
     kf, var, seen = out[0, pi, ti], out[1, pi, ti], out[2, pi, ti].astype(bool)
     b60 = Y[pi, ti, cfg["kalman_obs"].index("beta_60m")]
