@@ -10,6 +10,8 @@ import polars as pl
 import xgboost as xgb
 from sklearn.linear_model import Ridge
 
+from src.cfi import cfi_candidates, cfi_clusters, cfi_importance
+
 
 def _rk_me(s):
     """'YYYY-MM' -> month-end date."""
@@ -60,7 +62,58 @@ def _rk_mat(d, features):
     return d.select(features).cast(pl.Float32).to_numpy()  # nulls -> NaN (XGBoost handles them natively)
 
 
-def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False):
+def _rk_xgb(cfg, depth, trees, X, y, e):
+    kw = dict(device="cuda") if cfg["device"] == "cuda" and xgb.build_info().get("USE_CUDA") else {}
+    m = xgb.XGBRanker(**cfg["xgb_fixed"], max_depth=depth, n_estimators=trees, random_state=cfg["seed"], **kw)
+    m.fit(X, _rk_labels(e, y), qid=e.cast(pl.Int32).to_numpy())
+    return m
+
+
+def _rk_tune(tr, va, feats, cfg, ytr, yva, grid=None):
+    """Fit on train per depth, eval val IC every eval_every trees. Returns (best_ic, depth, trees, model); fills grid if given."""
+    Xtr, Xva = _rk_mat(tr, feats), _rk_mat(va, feats)
+    best, best_m = (-np.inf, None, None), None
+    for depth in cfg["xgb_depth_grid"]:
+        m = _rk_xgb(cfg, depth, cfg["xgb_max_trees"], Xtr, ytr, tr["eom"])
+        for k in range(cfg["xgb_eval_every"], cfg["xgb_max_trees"] + 1, cfg["xgb_eval_every"]):
+            ic = _rk_mean_ic(va["eom"], m.predict(Xva, iteration_range=(0, k)), yva)
+            if grid is not None:
+                grid[f"{depth}_{k}"] = ic
+            if ic > best[0]:
+                best, best_m = (ic, depth, k), m
+    return best[0], best[1], best[2], best_m
+
+
+def _rk_cfi_select(tr, va, features, cfg, ytr, yva, base, cfi_factors):
+    """CFI selection on one window (train rows cluster, val rows rank groups). Returns (feats, tuned, info)."""
+    fset = set(cfi_factors)
+    facs = [f for f in features if f in fset]
+    bic, _, btrees, bm = base
+    pf = lambda X: bm.predict(X, iteration_range=(0, btrees))
+    clusters, cands, seen = cfi_clusters(tr, facs, cfg), [], set()
+    for cut, groups in clusters.items():
+        imps = cfi_importance(pf, va, features, groups, cfg)
+        for share in cfg["cfi_shares"]:
+            sub = cfi_candidates(groups, imps, [share])[0]
+            key = frozenset(sub)
+            if key in seen:
+                continue
+            seen.add(key)
+            sel = [f for f in features if f in key or f not in fset]
+            t = _rk_tune(tr, va, sel, cfg, ytr, yva)
+            cands.append(dict(name=f"cut{cut:.2f}_top{round(share * 100)}", n_factors=len(key), val_ic=t[0], feats=sel, tuned=t))
+    best = None
+    for c in cands:  # strictly better IC wins; exact ties -> fewer features
+        if np.isfinite(c["val_ic"]) and (best is None or (c["val_ic"], -c["n_factors"]) > (best["val_ic"], -best["n_factors"])):
+            best = c
+    use = best is not None and (not np.isfinite(bic) or best["val_ic"] > bic)
+    info = dict(chosen=best["name"] if use else "all", n_factors=best["n_factors"] if use else len(facs),
+                val_ic_base=bic, val_ic_chosen=best["val_ic"] if use else bic,
+                candidates=[dict(name=c["name"], n_factors=c["n_factors"], val_ic=c["val_ic"]) for c in cands])
+    return (best["feats"], best["tuned"], info) if use else (features, base, info)
+
+
+def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False, cfi_factors=None):
     """Tune on val (train-only fits), refit on train+val, predict the test year. Returns (test_pred, val_pred, info)."""
     df = df.sort(["eom", "permno"])
     rng = lambda w: (pl.col("target_month") >= w[0]) & (pl.col("target_month") <= w[1])
@@ -71,30 +124,24 @@ def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False):
     ytr, yva = tr["ret_exc_lead1m"].to_numpy(), va["ret_exc_lead1m"].to_numpy()
     if shuffle:  # leakage test: destroy the label-feature link in train AND val
         ytr, yva = _rk_shuffle(tr["eom"], ytr, cfg["seed"]), _rk_shuffle(va["eom"], yva, cfg["seed"] + 1)
+    cfi_info = None
+    if model == "xgb":
+        grid = {}
+        tuned = _rk_tune(tr, va, features, cfg, ytr, yva, grid)
+        if cfi_factors is not None and cfg.get("cfi_enabled"):
+            features, tuned, cfi_info = _rk_cfi_select(tr, va, features, cfg, ytr, yva, tuned, cfi_factors)
     Xtr, Xva, Xte = _rk_mat(tr, features), _rk_mat(va, features), _rk_mat(te, features)
     Xall, yall = np.vstack([Xtr, Xva]), np.concatenate([ytr, yva])
     eall = pl.concat([tr["eom"], va["eom"]])
-    kw = dict(device="cuda") if cfg["device"] == "cuda" and xgb.build_info().get("USE_CUDA") else {}
 
-    def _xgb(depth, trees, X, y, e):
-        m = xgb.XGBRanker(**cfg["xgb_fixed"], max_depth=depth, n_estimators=trees, random_state=cfg["seed"], **kw)
-        m.fit(X, _rk_labels(e, y), qid=e.cast(pl.Int32).to_numpy())
-        return m
-
-    grid, best, val_score, best_m = {}, (-np.inf, None, None), None, None
     if model == "xgb":
-        for depth in cfg["xgb_depth_grid"]:
-            m = _xgb(depth, cfg["xgb_max_trees"], Xtr, ytr, tr["eom"])
-            for k in range(cfg["xgb_eval_every"], cfg["xgb_max_trees"] + 1, cfg["xgb_eval_every"]):
-                s = m.predict(Xva, iteration_range=(0, k))
-                ic = _rk_mean_ic(va["eom"], s, yva)
-                grid[f"{depth}_{k}"] = ic
-                if ic > best[0]:
-                    best, val_score, best_m = (ic, depth, k), s, m
-        final = _xgb(best[1], best[2], Xall, yall, eall)
+        best, best_m = tuned[:3], tuned[3]
+        val_score = best_m.predict(Xva, iteration_range=(0, best[2]))
+        final = _rk_xgb(cfg, best[1], best[2], Xall, yall, eall)
         te_score = final.predict(Xte)
         va_all_score = best_m.predict(_rk_mat(va_all, features), iteration_range=(0, best[2]))
     else:  # ridge baseline on the features (template: Ridge on the 147 characteristics)
+        grid, best = {}, (-np.inf, None, None)
         Xtr0, Xva0, Xte0, Xall0 = (np.nan_to_num(x) for x in (Xtr, Xva, Xte, Xall))
         for a in cfg["ridge_alpha_grid"]:
             rm = Ridge(alpha=a).fit(Xtr0, ytr)
@@ -114,16 +161,18 @@ def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False):
     info = dict(year=win["year"], model=model, best_depth=best[1] if model == "xgb" else None,
                 best_trees=best[2], val_ic=best[0], grid=grid,
                 train_max_target=max(tr["target_month"].max(), va["target_month"].max()))  # step 11 check
+    if cfi_info is not None:
+        info["cfi"], info["features"] = cfi_info, list(features)
     if model == "ridge":
         info["best_alpha"] = best[1]
     return out(te, te_score), out(va_all, va_all_score), info
 
 
-def run_schedule(df, features, cfg, model="xgb", shuffle=False, return_vals=False):
+def run_schedule(df, features, cfg, model="xgb", shuffle=False, return_vals=False, cfi_factors=None):
     """Loop over test years. Returns (preds, val_2021, infos); with return_vals a 4th value {year: that window's val_pred}."""
     tests, infos, val_2021, vals = [], [], None, {}
     for w in windows(cfg):
-        t, v, i = fit_predict_year(df, features, w, cfg, model, shuffle)
+        t, v, i = fit_predict_year(df, features, w, cfg, model, shuffle, cfi_factors)
         tests.append(t); infos.append(i); vals[w["year"]] = v
         if w["year"] == 2021:
             val_2021 = v

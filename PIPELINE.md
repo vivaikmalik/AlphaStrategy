@@ -166,7 +166,7 @@ Tests and checks:
 
 ## 5. Ablations (step 12)
 
-All five use the same schedule, the same frozen d, `lambda_tc`, `lambda_beta` and short-eligible ME percentile, and the same optimiser. `factors` = the 147 ranked characteristics; `flags` = the `_miss` columns.
+All six use the same schedule, the same frozen d, `lambda_tc`, `lambda_beta` and short-eligible ME percentile, and the same optimiser. `factors` = the 147 ranked characteristics; `flags` = the `_miss` columns.
 
 | Name in code | Model | Features (as built in `main()`) | Question it answers |
 |---|---|---|---|
@@ -174,7 +174,8 @@ All five use the same schedule, the same frozen d, `lambda_tc`, `lambda_beta` an
 | `2_xgb_base` | XGB pairwise ranker | `factors` | Does the nonlinear ranker alone beat Ridge on the same 147 inputs? |
 | `3_plus_gru` | XGB | `factors + flags + gru_1..gru_d` | Do missing-value flags and GRU embeddings add anything? |
 | `4_plus_event` | XGB | `factors + flags + gru + 21 event columns` | Do 8-K event flags and history counts add anything? |
-| `5_plus_tone` | XGB (this is the main run, not refitted) | `factors + flags + gru + event + tone_mean, tone_min, tone_surprise` | Does FinBERT tone add anything? |
+| `5_plus_tone` | XGB, own refit, no CFI | `factors + flags + gru + event + tone_mean, tone_min, tone_surprise` | Does FinBERT tone add anything? |
+| `6_plus_cfi` | XGB (the main run, not refitted) | same as 5, with CFI selection over the 147 factors | Does CFI feature selection add anything? |
 
 Reported per ablation in `ablations.json`:
 
@@ -184,9 +185,13 @@ Reported per ablation in `ablations.json`:
 - `val_ic_by_year`: the best validation IC chosen in each of the six windows.
 - `ir` and `beta` (with Newey-West t): of the test-period book. `val_ir`, `val_beta`: of the 2019-2020 validation book.
 - `n_missing_returns`: held stock-months with no return (counted as 0).
-- `test_has_filing_rows` (ablations 4 and 5 only): test IC restricted to stock-months with `has_filing = 1`. This isolates whether the 8-K columns help where an 8-K actually exists.
+- `test_has_filing_rows` (ablations 4, 5 and 6 only): test IC restricted to stock-months with `has_filing = 1`. This isolates whether the 8-K columns help where an 8-K actually exists.
 
 The missing-value flags first enter at ablation 3 (together with the GRU), not at ablation 2. So the ablation 2 to 3 step changes two things at once.
+
+## CFI feature selection
+
+Port of a teammate's experiment (`src/cfi.py`, enabled by `cfi_enabled`). In each walk-forward window the 147 factors are clustered on the training months, group permutation importance is computed per cluster on the validation months, and the subset of factor groups is chosen by validation IC. The non-factor features (flags, GRU, event, tone) are kept. The chosen factors are logged per test year under `cfi` in `settings_log.json`. The teammate's own result: test rank IC 0.065 -> 0.088 on average, with gains mostly from 2023 and selections unstable from year to year. It is applied to the main model only (step-10 tuning, beta-fix books and the shuffled-label run run without it); ablation 6 (vs 5) isolates its effect.
 
 ## 6. How the 8-K filings are used
 

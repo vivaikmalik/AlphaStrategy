@@ -333,7 +333,7 @@ def _pipe_v4_net(rets, cfg):
 
 def _pipe_v4_job(sc, params, frame, market, v4rets, cfg):
     w, log = run_book_v4(sc, cfg, {e: params for e in sc["eom"].unique().to_list()}, v4rets)
-    if any(str(r.get("attempt", "")).startswith("hold") for r in log):   # incomplete book: disqualify (as teammate)
+    if w.height == 0 or any(str(r.get("attempt", "")).startswith("hold") for r in log):   # incomplete: disqualify (as teammate)
         return float("nan"), float("nan"), float("nan")
     rets, _ = book_returns(w, frame, market, cfg)
     return _pipe_ir(_pipe_v4_net(rets, cfg)), _pipe_ir(rets), float(rets["turnover"].mean())
@@ -480,13 +480,13 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
 
 
 def _pipe_ablations(frame, runs, choice, market, cfg, rm, v4=None):
-    """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4 and 5. Main book, each ablation's own val ICs."""
+    """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4, 5 and 6. Main book, each ablation's own val ICs."""
     jobs = [(r["preds"], _pipe_ic_map(r["infos"], frame, cfg), v4) if k == "preds" else (r["val"], _pipe_ic_map(r["infos"], frame, cfg, val=True), v4 and {**v4, "val": True})
             for r in runs.values() for k in ("preds", "val")]
     books = Parallel(n_jobs=min(cfg["n_jobs"], len(jobs)), backend="loky")(
         delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm, ic, False, v4_) for p, ic, v4_ in jobs)
     out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (XGB); missing-value flags enter from "
-                            "ablation 3 onward; 5 = full main feature set. val_ir/val_beta: book on 2021-window val_pred."}
+                            "ablation 3 onward; 5 = full feature set without CFI; 6 = same plus CFI feature selection (the main run, reused). val_ir/val_beta: book on 2021-window val_pred."}
     for i, (name, r) in enumerate(runs.items()):
         _, rets, n_miss = books[2 * i]
         vrets = books[2 * i + 1][1]
@@ -532,7 +532,14 @@ def main(cfg):
     _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs}, "settings_log.json", cfg)
 
     # step 5 + 9: full schedule, predictions, book, performance, submission
-    preds, val_2021, infos, vals_y = run_schedule(frame, full, cfg, return_vals=True)
+    cfi = {"cfi_factors": factors} if cfg.get("cfi_enabled") else {}
+    preds, val_2021, infos, vals_y = run_schedule(frame, full, cfg, return_vals=True, **cfi)
+    cfi_log = {}
+    for i in infos:
+        c = i.get("cfi")
+        if c:
+            cfi_log[i["year"]] = c
+            _pipe_log(f"cfi {i['year']}: {c['chosen']} n_factors={c['n_factors']} val IC {c['val_ic_base']:.4f} -> {c['val_ic_chosen']:.4f}")
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
     ic_test = _pipe_ic_map(infos, frame, cfg)           # per test year: that window's validation IC (a pre-test quantity)
@@ -554,7 +561,7 @@ def main(cfg):
               f"beta {spec_book['beta']:.3f} | {cfg['book']} val IR {v2_val['ir']:.3f} beta {v2_val['beta']:.3f}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
-    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos,
+    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos, "cfi": cfi_log,
                 "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
                 "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel,
                 "v4_tuning": v4_log, "v4_chosen": v4_params, "chosen_book_net_of_fee": net_stats},
@@ -570,7 +577,10 @@ def main(cfg):
         p, v, i = run_schedule(frame, cols, cfg, model=model)
         runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
         _pipe_log(f"ablation {name} done")
-    runs["5_plus_tone"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
+    p, v, i = run_schedule(frame, full, cfg)         # full feature set, no CFI: isolates CFI in ablation 6
+    runs["5_plus_tone"] = {"preds": p, "val": v, "infos": i, "n_features": len(full), "has_filing_ic": True}
+    _pipe_log("ablation 5_plus_tone done")
+    runs["6_plus_cfi"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
     _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm, v4), "ablations.json", cfg)
 
     # step 11: leakage tests incl. shuffled-label run

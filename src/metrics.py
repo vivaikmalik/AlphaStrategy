@@ -30,7 +30,8 @@ def book_returns(weights, panel, market, cfg):
     # turnover = sum |w_t - w_{t-1}| over the union of names (absent = 0); first month starts from cash
     pw = w.to_pandas().pivot_table(index="eom", columns="permno", values="weight", aggfunc="sum").sort_index().fillna(0.0)
     to = pw.diff().abs().sum(axis=1)
-    to.iloc[0] = pw.iloc[0].abs().sum()
+    if len(to):
+        to.iloc[0] = pw.iloc[0].abs().sum()
     g = g.join(pl.DataFrame({"eom": pl.Series(to.index).cast(pl.Date), "turnover": to.values}), on="eom")
     mk = market.with_columns(eom=pl.col("eom").dt.offset_by("-1mo").dt.month_end()).select(  # key on formation month
         "eom", rf=pl.col("tb3ms") / 1200, sp500=pl.col("sp500_ret"))

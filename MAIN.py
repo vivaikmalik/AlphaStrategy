@@ -152,6 +152,17 @@ CONFIG = {
     "v4_min_names": 100,
     "v4_max_names": 500,
 
+    # --- CFI feature selection (not in spec): port of teammate's branch experience-cfi-xgboost (src/fiam/cfi.py).
+    #     Per window: cluster the 147 factors on TRAINING months (median monthly Spearman, 1-|rho|, complete linkage),
+    #     group permutation importance on VALIDATION with the train-only model, keep top shares of groups, pick the
+    #     subset with the best validation IC (ties -> smaller); all-147 kept if nothing beats it. Main model only.
+    "cfi_enabled": True,
+    "cfi_cuts": [0.65, 0.75, 0.85],         # |rho| cut levels (distance 0.35 / 0.25 / 0.15)
+    "cfi_shares": [0.25, 0.50, 0.75],       # share of top-ranked groups kept
+    "cfi_repeats": 3,                       # permutation seeds: seed, seed+1, seed+2
+    "cfi_min_pairs": 100,                   # min stocks with both factors observed for a valid monthly correlation
+    "cfi_min_months": 12,                   # min valid months for a pair
+
     # --- analyst agent (spec step A, lite): explains top holdings; never feeds signal or weights ---
     "agent_enabled": True,                  # skipped with a warning if the LLM server is unreachable
     "agent_url": "http://localhost:11434/v1/chat/completions",   # Ollama OpenAI-compatible endpoint on the GX10
@@ -607,6 +618,120 @@ def kalman_betas(panel, cfg, r_floor=None):
     return df, params
 
 
+# ===== src/cfi.py =====
+"""
+src/cfi.py - Clustered Feature Importance helpers (port of teammate's experience-cfi-xgboost src/fiam/cfi.py).
+Factors are clustered on TRAIN months (median monthly Spearman, d = 1-|rho|, complete linkage); groups are permuted jointly
+within each VALIDATION month; top-ranked groups form candidate factor subsets. Model tuning lives in src/ranker.py.
+"""
+import math
+import warnings
+
+import numpy as np
+import polars as pl
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+from scipy.stats import rankdata
+
+
+def _cfi_month_corr(X):
+    """Spearman matrix of one month (ranked columns used as is, nulls already 0) and its stock count."""
+    X = np.nan_to_num(X.astype("float64"))
+    if len(X) < 3:
+        return np.full((X.shape[1],) * 2, np.nan), len(X)
+    with np.errstate(all="ignore"):
+        return np.corrcoef(rankdata(X, axis=0).T), len(X)
+
+
+def cfi_clusters(train_df, factors, cfg):
+    """{cut: [groups]} - groups are lists of factor names. Under-documented pairs -> their factors stay singletons (last)."""
+    p = len(factors)
+    rhos, ns = [], []
+    for _, d in train_df.group_by("eom", maintain_order=True):
+        r, n = _cfi_month_corr(d.select(factors).to_numpy())
+        rhos.append(r)
+        ns.append(n)
+    if rhos:
+        rho = np.stack(rhos)
+        valid = (np.array(ns)[:, None, None] >= cfg["cfi_min_pairs"]) & np.isfinite(rho)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            med = np.nanmedian(np.where(valid, rho, np.nan), axis=0)
+        ok = valid.sum(axis=0) >= cfg["cfi_min_months"]
+    else:
+        med, ok = np.full((p, p), np.nan), np.zeros((p, p), bool)
+    np.fill_diagonal(ok, True)
+    bad = ~ok | ~np.isfinite(med)
+    np.fill_diagonal(bad, False)
+    iso = [i for i in range(p) if bad[i].any()]
+    keep = [i for i in range(p) if i not in iso]
+    Z = None
+    if len(keep) > 1:
+        D = 1.0 - np.abs(med[np.ix_(keep, keep)])
+        D = np.clip((D + D.T) / 2.0, 0.0, None)
+        np.fill_diagonal(D, 0.0)
+        Z = linkage(squareform(D, checks=False), method="complete")
+    out = {}
+    for cut in cfg["cfi_cuts"]:
+        labels = fcluster(Z, t=1.0 - cut, criterion="distance") if Z is not None else np.ones(len(keep))
+        by = {}
+        for i, lab in zip(keep, labels):
+            by.setdefault(lab, []).append(i)
+        groups = sorted(by.values(), key=lambda g: g[0]) + [[i] for i in iso]
+        out[cut] = [[factors[i] for i in g] for g in groups]
+    return out
+
+
+def _cfi_mean_ic(eom, score, y):
+    d = pl.DataFrame({"eom": eom, "s": score, "y": y}).drop_nulls("y").group_by("eom").agg(
+        pl.corr(pl.col("s").rank(), pl.col("y").rank()).alias("ic"))["ic"].drop_nans().drop_nulls()
+    return float(d.mean()) if len(d) else float("nan")
+
+
+def _cfi_perm(eom, seed):
+    """Row permutation that stays inside each month (months visited in sorted order, so (seed, month) is reproducible)."""
+    rng = np.random.default_rng(seed)
+    perm = np.arange(len(eom))
+    order = np.argsort(eom, kind="stable")
+    se = eom[order]
+    for pos in np.split(order, np.flatnonzero(se[1:] != se[:-1]) + 1):
+        perm[pos] = rng.permutation(pos)
+    return perm
+
+
+def cfi_importance(predict_fn, val_df, features, groups, cfg):
+    """[(group_index, importance)]; importance = base mean monthly rank IC - mean over seeds of permuted IC."""
+    X = val_df.select(features).cast(pl.Float32).to_numpy()
+    eom, y = val_df["eom"], val_df["ret_exc_lead1m"]
+    base = _cfi_mean_ic(eom, predict_fn(X), y)
+    eom_np = eom.to_numpy()
+    perms = [_cfi_perm(eom_np, cfg["seed"] + r) for r in range(cfg["cfi_repeats"])]
+    idx = {f: i for i, f in enumerate(features)}
+    out = []
+    for gi, g in enumerate(groups):
+        cols = [idx[f] for f in g]
+        ics = []
+        for perm in perms:
+            Xp = X.copy()
+            Xp[:, cols] = X[perm][:, cols]  # one permutation for every column of the group
+            ics.append(_cfi_mean_ic(eom, predict_fn(Xp), y))
+        out.append((gi, base - float(np.mean(ics))))
+    return out
+
+
+def cfi_candidates(groups, importances, shares):
+    """Factor subsets: top ceil(share*n_groups) groups by importance (ties -> group order); duplicates dropped."""
+    ranked = sorted(importances, key=lambda t: (-t[1], t[0]))
+    seen, out = set(), []
+    for s in shares:
+        k = max(1, math.ceil(s * len(groups) - 1e-9))
+        sub = [f for gi, _ in ranked[:k] for f in groups[gi]]
+        if tuple(sub) not in seen:
+            seen.add(tuple(sub))
+            out.append(sub)
+    return out
+
+
 # ===== src/ranker.py =====
 """
 src/ranker.py - Step 5: XGBRanker (rank:pairwise, qid = eom) with walk-forward windows, plus the Ridge baseline.
@@ -619,6 +744,7 @@ import numpy as np
 import polars as pl
 import xgboost as xgb
 from sklearn.linear_model import Ridge
+
 
 
 def _rk_me(s):
@@ -670,7 +796,58 @@ def _rk_mat(d, features):
     return d.select(features).cast(pl.Float32).to_numpy()  # nulls -> NaN (XGBoost handles them natively)
 
 
-def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False):
+def _rk_xgb(cfg, depth, trees, X, y, e):
+    kw = dict(device="cuda") if cfg["device"] == "cuda" and xgb.build_info().get("USE_CUDA") else {}
+    m = xgb.XGBRanker(**cfg["xgb_fixed"], max_depth=depth, n_estimators=trees, random_state=cfg["seed"], **kw)
+    m.fit(X, _rk_labels(e, y), qid=e.cast(pl.Int32).to_numpy())
+    return m
+
+
+def _rk_tune(tr, va, feats, cfg, ytr, yva, grid=None):
+    """Fit on train per depth, eval val IC every eval_every trees. Returns (best_ic, depth, trees, model); fills grid if given."""
+    Xtr, Xva = _rk_mat(tr, feats), _rk_mat(va, feats)
+    best, best_m = (-np.inf, None, None), None
+    for depth in cfg["xgb_depth_grid"]:
+        m = _rk_xgb(cfg, depth, cfg["xgb_max_trees"], Xtr, ytr, tr["eom"])
+        for k in range(cfg["xgb_eval_every"], cfg["xgb_max_trees"] + 1, cfg["xgb_eval_every"]):
+            ic = _rk_mean_ic(va["eom"], m.predict(Xva, iteration_range=(0, k)), yva)
+            if grid is not None:
+                grid[f"{depth}_{k}"] = ic
+            if ic > best[0]:
+                best, best_m = (ic, depth, k), m
+    return best[0], best[1], best[2], best_m
+
+
+def _rk_cfi_select(tr, va, features, cfg, ytr, yva, base, cfi_factors):
+    """CFI selection on one window (train rows cluster, val rows rank groups). Returns (feats, tuned, info)."""
+    fset = set(cfi_factors)
+    facs = [f for f in features if f in fset]
+    bic, _, btrees, bm = base
+    pf = lambda X: bm.predict(X, iteration_range=(0, btrees))
+    clusters, cands, seen = cfi_clusters(tr, facs, cfg), [], set()
+    for cut, groups in clusters.items():
+        imps = cfi_importance(pf, va, features, groups, cfg)
+        for share in cfg["cfi_shares"]:
+            sub = cfi_candidates(groups, imps, [share])[0]
+            key = frozenset(sub)
+            if key in seen:
+                continue
+            seen.add(key)
+            sel = [f for f in features if f in key or f not in fset]
+            t = _rk_tune(tr, va, sel, cfg, ytr, yva)
+            cands.append(dict(name=f"cut{cut:.2f}_top{round(share * 100)}", n_factors=len(key), val_ic=t[0], feats=sel, tuned=t))
+    best = None
+    for c in cands:  # strictly better IC wins; exact ties -> fewer features
+        if np.isfinite(c["val_ic"]) and (best is None or (c["val_ic"], -c["n_factors"]) > (best["val_ic"], -best["n_factors"])):
+            best = c
+    use = best is not None and (not np.isfinite(bic) or best["val_ic"] > bic)
+    info = dict(chosen=best["name"] if use else "all", n_factors=best["n_factors"] if use else len(facs),
+                val_ic_base=bic, val_ic_chosen=best["val_ic"] if use else bic,
+                candidates=[dict(name=c["name"], n_factors=c["n_factors"], val_ic=c["val_ic"]) for c in cands])
+    return (best["feats"], best["tuned"], info) if use else (features, base, info)
+
+
+def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False, cfi_factors=None):
     """Tune on val (train-only fits), refit on train+val, predict the test year. Returns (test_pred, val_pred, info)."""
     df = df.sort(["eom", "permno"])
     rng = lambda w: (pl.col("target_month") >= w[0]) & (pl.col("target_month") <= w[1])
@@ -681,30 +858,24 @@ def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False):
     ytr, yva = tr["ret_exc_lead1m"].to_numpy(), va["ret_exc_lead1m"].to_numpy()
     if shuffle:  # leakage test: destroy the label-feature link in train AND val
         ytr, yva = _rk_shuffle(tr["eom"], ytr, cfg["seed"]), _rk_shuffle(va["eom"], yva, cfg["seed"] + 1)
+    cfi_info = None
+    if model == "xgb":
+        grid = {}
+        tuned = _rk_tune(tr, va, features, cfg, ytr, yva, grid)
+        if cfi_factors is not None and cfg.get("cfi_enabled"):
+            features, tuned, cfi_info = _rk_cfi_select(tr, va, features, cfg, ytr, yva, tuned, cfi_factors)
     Xtr, Xva, Xte = _rk_mat(tr, features), _rk_mat(va, features), _rk_mat(te, features)
     Xall, yall = np.vstack([Xtr, Xva]), np.concatenate([ytr, yva])
     eall = pl.concat([tr["eom"], va["eom"]])
-    kw = dict(device="cuda") if cfg["device"] == "cuda" and xgb.build_info().get("USE_CUDA") else {}
 
-    def _xgb(depth, trees, X, y, e):
-        m = xgb.XGBRanker(**cfg["xgb_fixed"], max_depth=depth, n_estimators=trees, random_state=cfg["seed"], **kw)
-        m.fit(X, _rk_labels(e, y), qid=e.cast(pl.Int32).to_numpy())
-        return m
-
-    grid, best, val_score, best_m = {}, (-np.inf, None, None), None, None
     if model == "xgb":
-        for depth in cfg["xgb_depth_grid"]:
-            m = _xgb(depth, cfg["xgb_max_trees"], Xtr, ytr, tr["eom"])
-            for k in range(cfg["xgb_eval_every"], cfg["xgb_max_trees"] + 1, cfg["xgb_eval_every"]):
-                s = m.predict(Xva, iteration_range=(0, k))
-                ic = _rk_mean_ic(va["eom"], s, yva)
-                grid[f"{depth}_{k}"] = ic
-                if ic > best[0]:
-                    best, val_score, best_m = (ic, depth, k), s, m
-        final = _xgb(best[1], best[2], Xall, yall, eall)
+        best, best_m = tuned[:3], tuned[3]
+        val_score = best_m.predict(Xva, iteration_range=(0, best[2]))
+        final = _rk_xgb(cfg, best[1], best[2], Xall, yall, eall)
         te_score = final.predict(Xte)
         va_all_score = best_m.predict(_rk_mat(va_all, features), iteration_range=(0, best[2]))
     else:  # ridge baseline on the features (template: Ridge on the 147 characteristics)
+        grid, best = {}, (-np.inf, None, None)
         Xtr0, Xva0, Xte0, Xall0 = (np.nan_to_num(x) for x in (Xtr, Xva, Xte, Xall))
         for a in cfg["ridge_alpha_grid"]:
             rm = Ridge(alpha=a).fit(Xtr0, ytr)
@@ -724,16 +895,18 @@ def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False):
     info = dict(year=win["year"], model=model, best_depth=best[1] if model == "xgb" else None,
                 best_trees=best[2], val_ic=best[0], grid=grid,
                 train_max_target=max(tr["target_month"].max(), va["target_month"].max()))  # step 11 check
+    if cfi_info is not None:
+        info["cfi"], info["features"] = cfi_info, list(features)
     if model == "ridge":
         info["best_alpha"] = best[1]
     return out(te, te_score), out(va_all, va_all_score), info
 
 
-def run_schedule(df, features, cfg, model="xgb", shuffle=False, return_vals=False):
+def run_schedule(df, features, cfg, model="xgb", shuffle=False, return_vals=False, cfi_factors=None):
     """Loop over test years. Returns (preds, val_2021, infos); with return_vals a 4th value {year: that window's val_pred}."""
     tests, infos, val_2021, vals = [], [], None, {}
     for w in windows(cfg):
-        t, v, i = fit_predict_year(df, features, w, cfg, model, shuffle)
+        t, v, i = fit_predict_year(df, features, w, cfg, model, shuffle, cfi_factors)
         tests.append(t); infos.append(i); vals[w["year"]] = v
         if w["year"] == 2021:
             val_2021 = v
@@ -1326,7 +1499,8 @@ def book_returns(weights, panel, market, cfg):
     # turnover = sum |w_t - w_{t-1}| over the union of names (absent = 0); first month starts from cash
     pw = w.to_pandas().pivot_table(index="eom", columns="permno", values="weight", aggfunc="sum").sort_index().fillna(0.0)
     to = pw.diff().abs().sum(axis=1)
-    to.iloc[0] = pw.iloc[0].abs().sum()
+    if len(to):
+        to.iloc[0] = pw.iloc[0].abs().sum()
     g = g.join(pl.DataFrame({"eom": pl.Series(to.index).cast(pl.Date), "turnover": to.values}), on="eom")
     mk = market.with_columns(eom=pl.col("eom").dt.offset_by("-1mo").dt.month_end()).select(  # key on formation month
         "eom", rf=pl.col("tb3ms") / 1200, sp500=pl.col("sp500_ret"))
@@ -2152,7 +2326,7 @@ def _pipe_v4_net(rets, cfg):
 
 def _pipe_v4_job(sc, params, frame, market, v4rets, cfg):
     w, log = run_book_v4(sc, cfg, {e: params for e in sc["eom"].unique().to_list()}, v4rets)
-    if any(str(r.get("attempt", "")).startswith("hold") for r in log):   # incomplete book: disqualify (as teammate)
+    if w.height == 0 or any(str(r.get("attempt", "")).startswith("hold") for r in log):   # incomplete: disqualify (as teammate)
         return float("nan"), float("nan"), float("nan")
     rets, _ = book_returns(w, frame, market, cfg)
     return _pipe_ir(_pipe_v4_net(rets, cfg)), _pipe_ir(rets), float(rets["turnover"].mean())
@@ -2299,13 +2473,13 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
 
 
 def _pipe_ablations(frame, runs, choice, market, cfg, rm, v4=None):
-    """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4 and 5. Main book, each ablation's own val ICs."""
+    """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4, 5 and 6. Main book, each ablation's own val ICs."""
     jobs = [(r["preds"], _pipe_ic_map(r["infos"], frame, cfg), v4) if k == "preds" else (r["val"], _pipe_ic_map(r["infos"], frame, cfg, val=True), v4 and {**v4, "val": True})
             for r in runs.values() for k in ("preds", "val")]
     books = Parallel(n_jobs=min(cfg["n_jobs"], len(jobs)), backend="loky")(
         delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm, ic, False, v4_) for p, ic, v4_ in jobs)
     out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (XGB); missing-value flags enter from "
-                            "ablation 3 onward; 5 = full main feature set. val_ir/val_beta: book on 2021-window val_pred."}
+                            "ablation 3 onward; 5 = full feature set without CFI; 6 = same plus CFI feature selection (the main run, reused). val_ir/val_beta: book on 2021-window val_pred."}
     for i, (name, r) in enumerate(runs.items()):
         _, rets, n_miss = books[2 * i]
         vrets = books[2 * i + 1][1]
@@ -2351,7 +2525,14 @@ def main(cfg):
     _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs}, "settings_log.json", cfg)
 
     # step 5 + 9: full schedule, predictions, book, performance, submission
-    preds, val_2021, infos, vals_y = run_schedule(frame, full, cfg, return_vals=True)
+    cfi = {"cfi_factors": factors} if cfg.get("cfi_enabled") else {}
+    preds, val_2021, infos, vals_y = run_schedule(frame, full, cfg, return_vals=True, **cfi)
+    cfi_log = {}
+    for i in infos:
+        c = i.get("cfi")
+        if c:
+            cfi_log[i["year"]] = c
+            _pipe_log(f"cfi {i['year']}: {c['chosen']} n_factors={c['n_factors']} val IC {c['val_ic_base']:.4f} -> {c['val_ic_chosen']:.4f}")
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
     ic_test = _pipe_ic_map(infos, frame, cfg)           # per test year: that window's validation IC (a pre-test quantity)
@@ -2373,7 +2554,7 @@ def main(cfg):
               f"beta {spec_book['beta']:.3f} | {cfg['book']} val IR {v2_val['ir']:.3f} beta {v2_val['beta']:.3f}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
-    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos,
+    _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos, "cfi": cfi_log,
                 "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
                 "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel,
                 "v4_tuning": v4_log, "v4_chosen": v4_params, "chosen_book_net_of_fee": net_stats},
@@ -2389,7 +2570,10 @@ def main(cfg):
         p, v, i = run_schedule(frame, cols, cfg, model=model)
         runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
         _pipe_log(f"ablation {name} done")
-    runs["5_plus_tone"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
+    p, v, i = run_schedule(frame, full, cfg)         # full feature set, no CFI: isolates CFI in ablation 6
+    runs["5_plus_tone"] = {"preds": p, "val": v, "infos": i, "n_features": len(full), "has_filing_ic": True}
+    _pipe_log("ablation 5_plus_tone done")
+    runs["6_plus_cfi"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
     _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm, v4), "ablations.json", cfg)
 
     # step 11: leakage tests incl. shuffled-label run

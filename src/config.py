@@ -149,6 +149,17 @@ CONFIG = {
     "v4_min_names": 100,
     "v4_max_names": 500,
 
+    # --- CFI feature selection (not in spec): port of teammate's branch experience-cfi-xgboost (src/fiam/cfi.py).
+    #     Per window: cluster the 147 factors on TRAINING months (median monthly Spearman, 1-|rho|, complete linkage),
+    #     group permutation importance on VALIDATION with the train-only model, keep top shares of groups, pick the
+    #     subset with the best validation IC (ties -> smaller); all-147 kept if nothing beats it. Main model only.
+    "cfi_enabled": True,
+    "cfi_cuts": [0.65, 0.75, 0.85],         # |rho| cut levels (distance 0.35 / 0.25 / 0.15)
+    "cfi_shares": [0.25, 0.50, 0.75],       # share of top-ranked groups kept
+    "cfi_repeats": 3,                       # permutation seeds: seed, seed+1, seed+2
+    "cfi_min_pairs": 100,                   # min stocks with both factors observed for a valid monthly correlation
+    "cfi_min_months": 12,                   # min valid months for a pair
+
     # --- analyst agent (spec step A, lite): explains top holdings; never feeds signal or weights ---
     "agent_enabled": True,                  # skipped with a warning if the LLM server is unreachable
     "agent_url": "http://localhost:11434/v1/chat/completions",   # Ollama OpenAI-compatible endpoint on the GX10
