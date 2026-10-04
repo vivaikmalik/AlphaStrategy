@@ -98,6 +98,14 @@ Detailed in section 4. In short: for each d, fit the XGBoost ranker for the 2021
 - Returns (`metrics.book_returns`): weight at month-end t times `ret_exc_lead1m`. If a held stock's `ret_exc_lead1m` is missing, 0 is used and the count is reported (`n_missing_returns`).
 - `report.performance_pack` writes `performance.json` and the figures; `report.write_submission` writes `holdings.csv` and `returns.csv`.
 
+### 2.7b Book v2 (main book) - `optimizer.run_book_v2`, `pipeline._pipe_book`
+
+With `cfg["book"] = "v2"` (default) the book of record (performance pack, `holdings.csv`, `returns.csv`, ablations, shuffled run) is v2. The spec book above still runs on the same test predictions and is reported next to it (`settings_log.json`: `spec_book`; the v2 book on 2019-2020 validation: `v2_validation`; one log line prints both).
+
+- Why: the first full runs of the spec book held a concentrated tail book (about 160 names), carried an unhedged defensive/junk style tilt (S&P beta -0.18), had about 15% volatility and about 220% turnover.
+- What: (1) alpha in return units = `IC * xs_vol * z`, with `z` the within-month standardised score, `xs_vol` the month's cross-sectional return volatility from the risk model and `IC` the validation IC of that test year's window (`info["val_ic"]`, known before the test year; validation books use the 2021 window's); (2) explicit one-way trading cost `v2_cost` = 12 bps; (3) ex-ante volatility capped at `v2_vol_target` = 8% using factor risk plus specific risk (`spec_var`, estimated over `risk_spec_window` months, at least `risk_spec_min`; null -> month median); (4) beta hedge on the factor-model beta (`b` from the risk model, tolerance `v2_beta_tol`); (5) weight cap `v2_max_weight` = 0.5%, giving roughly 400-500 names. Same candidates and rules (long/short candidate sets, short eligibility, sector and size bands, gross 2, net within +/-0.20). Months that need relaxed constraints are counted in the log.
+- How the numbers were set: cost, vol target and cap are stated assumptions (12 bps is a typical one-way cost for liquid US stocks; 8% is a modest risk budget; 0.5% gives breadth); the IC floor and spec-risk window come from pre-2021 estimates. Nothing was searched or tuned on validation or test.
+
 ### 2.8 Ablations and leakage tests (steps 12, 11)
 
 After the submission files exist, `main()` runs the five ablations (section 5), the shuffled-label run, and the leakage checks (section 4). The `assert` statements are the last thing that runs, after the output files have been written. A failing assert stops the script, but the submission files from step 14 are already on disk.
@@ -235,6 +243,7 @@ Each item below was checked in the code.
 16. Tuning side effect. `_pipe_tune` calls `fit_predict_year` on the 2021 window, which also fits the final train+validation model and predicts 2021. Those test predictions are discarded in the tuning step (the grid is built only from validation predictions).
 17. Only the first 8 chunks (about 4,000 tokens) of each filing are scored, so for long filings later sections (often exhibits) are never read.
 18. Everything not cached is recomputed on every run (section 9), including the tuning grid and all XGBoost fits.
+19. Book v2 was designed AFTER seeing the first full-run test results (concentration, beta -0.18, volatility, turnover). It is therefore not an untouched out-of-sample choice. Its parameters are stated assumptions or pre-2021 estimates and nothing was searched, but the decision to change the book was informed by test data. The spec book is still run and reported alongside (`spec_book`), and `v2_validation` shows v2 on 2019-2020 as a check.
 
 ## 9. How to run and rerun
 

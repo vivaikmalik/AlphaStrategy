@@ -98,3 +98,119 @@ def run_book(scored, lam_tc, lam_beta, cfg, lam_risk=0.0, lam_fac=0.0, rm=None):
         w_prev = w
     wdf = pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row")
     return wdf, log
+
+
+def _opt_ladder(cfg):
+    """Relaxation steps (sector/size band, beta tol, vol multiplier): bands first, then beta, then vol (each stage keeps earlier relaxations)."""
+    b0, s0, t0 = cfg["sector_band"], cfg["size_band"], cfg["v2_beta_tol"]
+    steps = [(b0, s0, t0, 1.0)]
+    b, s = b0, s0
+    for _ in range(9):
+        b, s = b + 0.05, s + 0.05
+        steps.append((b, s, t0, 1.0))
+    t = t0
+    for _ in range(int(round((0.5 - t0) / 0.01))):
+        t += 0.01
+        steps.append((b, s, t, 1.0))
+    m = 1.0
+    while m < 4.0 - 1e-9:
+        m = min(m * 1.25, 4.0)
+        steps.append((b, s, t, m))
+    return steps
+
+
+def optimize_month_v2(mdf, w_prev, cfg, risk, ic):
+    """One month -> (weights dict, info dict). Max alpha.w - v2_cost*|w - w_prev|_1 s.t. gross/net/sector/size/beta/ex-ante vol caps.
+    risk = (sectors, L, b, xs_vol); alpha = max(ic, floor) * xs_vol * z (monthly expected excess return). L None -> vol constraint off."""
+    sectors, L, b_vec, xs_vol = risk
+    cap = cfg["v2_max_weight"]
+    d = mdf.with_columns(pl.col("sector").fill_null("NA")).sort("permno").with_columns(
+        ((pl.col("score") - pl.col("score").mean()) / pl.col("score").std()).fill_nan(0.0).fill_null(0.0).alias("s"),
+        pl.col("spec_var").fill_nan(None).fill_null(pl.col("spec_var").median()).fill_null(0.0).clip(lower_bound=0.0),
+        pl.col("size_z").fill_nan(None).fill_null(0.0))
+    long_ids = set(d.sort(["s", "permno"], descending=[True, False]).head(cfg["n_long_cand"])["permno"])
+    short_ids = set(d.filter(pl.col("short_eligible") & ~pl.col("permno").is_in(long_ids))
+                    .sort(["s", "permno"]).head(cfg["n_short_cand"])["permno"])
+    c = d.filter(pl.col("permno").is_in(long_ids | short_ids))
+    ids = c["permno"].to_list(); n = len(ids)
+    alpha = max(ic, cfg["v2_ic_floor"]) * xs_vol * c["s"].to_numpy()
+    sz, spec = c["size_z"].to_numpy(), np.sqrt(c["spec_var"].to_numpy())
+    ubL = np.array([cap if p in long_ids else 0.0 for p in ids])
+    ubS = np.array([cap if p in short_ids else 0.0 for p in ids])
+    G = (c["sector"].to_numpy()[None, :] == np.unique(c["sector"].to_numpy())[:, None]).astype(float)
+    X = risk_exposures(c, sectors, cfg) if (L is not None or b_vec is not None) else None
+    if b_vec is not None:
+        beta = X @ np.asarray(b_vec, dtype=float)
+    elif "beta_kf" in c.columns:
+        beta = c["beta_kf"].fill_nan(None).fill_null(0.0).to_numpy()
+    else:
+        beta = None
+    LtXt = L.T @ X.T if L is not None else None
+    wp = np.clip(np.nan_to_num(np.array([w_prev.get(p, 0.0) for p in ids])), -cap, cap)
+    dropped = sum(abs(v) for p, v in w_prev.items() if p not in set(ids))   # names that left the candidate set: sold to 0
+
+    wL, wS = cp.Variable(n, nonneg=True), cp.Variable(n, nonneg=True)
+    band, sband, tol, vol = (cp.Parameter(nonneg=True) for _ in range(4))
+    w = wL - wS
+    cons = [cp.sum(wL) + cp.sum(wS) <= cfg["gross"], cp.abs(cp.sum(w)) <= cfg["net_band"], wL <= ubL, wS <= ubS,
+            cp.abs(G @ w) <= band, cp.abs(sz @ w) <= sband]
+    if beta is not None:
+        cons.append(cp.abs(beta @ w) <= tol)
+    if LtXt is not None:
+        cons.append(cp.norm(cp.hstack([LtXt @ w, cp.multiply(spec, w)])) <= vol)
+    prob = cp.Problem(cp.Maximize(alpha @ w - cfg["v2_cost"] * cp.norm1(w - wp)), cons)
+    vol0 = cfg["v2_vol_target"] / np.sqrt(12)
+
+    def solve(bd, sb, t_, vm):
+        band.value, sband.value, tol.value, vol.value = bd, sb, t_, vol0 * vm
+        try:
+            prob.solve(solver=cp.CLARABEL)
+        except cp.SolverError:
+            return False
+        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or w.value is None:
+            return False
+        v = w.value
+        return bool(np.all(np.isfinite(v)) and np.abs(v).max() <= cap + 1e-4 and np.abs(v).sum() <= cfg["gross"] + 1e-3
+                    and abs(v.sum()) <= cfg["net_band"] + 1e-3)                  # inaccurate solutions must still obey net
+
+    for bd, sb, t_, vm in _opt_ladder(cfg):
+        if solve(bd, sb, t_, vm):
+            break
+    else:
+        print(f"[optimizer-v2] WARNING {mdf['eom'][0]}: infeasible even after full relaxation; holding previous weights")
+        return dict(w_prev), {"status": "fallback_hold", "n_long": sum(v > 0 for v in w_prev.values()),
+                              "n_short": sum(v < 0 for v in w_prev.values()), "gross": float(sum(abs(v) for v in w_prev.values())),
+                              "net": float(sum(w_prev.values())), "turnover": 0.0, "vol": None, "beta_pred": None, "relaxed": ["hold"]}
+    wv = np.where(np.abs(w.value) < 1e-7, 0.0, w.value)
+    relaxed = []
+    if bd > cfg["sector_band"] + 1e-9:
+        relaxed.append(f"sector/size band {bd:.2f}/{sb:.2f}")
+    if beta is not None and t_ > cfg["v2_beta_tol"] + 1e-9:
+        relaxed.append(f"beta tol {t_:.2f}")
+    if vm > 1.0 + 1e-9:
+        relaxed.append(f"vol target x{vm:.2f}")
+    var = float(np.sum((LtXt @ wv) ** 2) + np.sum((spec * wv) ** 2)) if LtXt is not None else None
+    weights = {p: float(x) for p, x in zip(ids, wv) if x != 0.0}
+    return weights, {"status": prob.status, "n_long": int((wv > 0).sum()), "n_short": int((wv < 0).sum()),
+                     "gross": float(np.abs(wv).sum()), "net": float(wv.sum()), "turnover": float(np.abs(wv - wp).sum() + dropped),
+                     "vol": float(np.sqrt(12 * var)) if var is not None else None,
+                     "beta_pred": float(beta @ wv) if beta is not None else None, "relaxed": relaxed}
+
+
+def run_book_v2(scored, cfg, rm, ic):
+    """scored: all months -> (weights df, log). ic: float or dict eom -> float; rm: risk model dict (sectors, L, xs_vol, optional b)."""
+    w_prev, rows, log = {}, [], []
+    for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
+        if eom in rm["L"] and eom in rm["xs_vol"]:
+            risk = (rm["sectors"], rm["L"][eom], rm.get("b", {}).get(eom), rm["xs_vol"][eom])
+        else:
+            print(f"[optimizer-v2] WARNING {eom}: no risk model, vol constraint off")
+            risk = (rm["sectors"], None, None, rm["xs_vol"].get(eom, 0.0))
+        w, info = optimize_month_v2(mdf, w_prev, cfg, risk, ic[eom] if isinstance(ic, dict) else ic)
+        if info["relaxed"]:
+            print(f"[optimizer-v2] {eom}: relaxed {', '.join(info['relaxed'])}")
+        log.append({"eom": eom, **info})
+        rows += [(p, eom, x) for p, x in w.items()]
+        w_prev = w
+    wdf = pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row")
+    return wdf, log

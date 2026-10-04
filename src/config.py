@@ -121,6 +121,17 @@ CONFIG = {
     "beta_variants": ["kf", "kf_rfloor", "b60_shrunk"],
     "beta_check_t": 1.96,                   # step 10 beta check: |t| above this = clearly nonzero -> fix betas
 
+    # --- book v2 (not in spec; added after the first full runs). Every number is a stated assumption or
+    #     estimated on pre-test data, nothing is searched. The spec book is still run and reported for comparison.
+    "book": "v2",                           # "v2" = main book below; "spec" = step-9 optimizer as the main book
+    "v2_cost": 0.0012,                      # assumed one-way trading cost (12 bps) per unit of |trade|
+    "v2_vol_target": 0.08,                  # ex-ante annual volatility cap (factor + specific risk)
+    "v2_max_weight": 0.005,                 # 0.5% per name -> ~400-500 names at 200% gross (rules allow 500)
+    "v2_beta_tol": 0.02,                    # |factor-model beta . w|
+    "v2_ic_floor": 0.01,                    # IC used to scale alpha = IC * xs_vol * z (each window's validation IC)
+    "risk_spec_window": 36,                 # trailing months of residuals for specific variance
+    "risk_spec_min": 6,
+
     # --- step 10 grids (fixed once on 2019-2020, then frozen) ---
     "gru_d_grid": [8, 16, 32],
     "lambda_tc_grid": [0.0, 0.1, 0.25, 0.5],

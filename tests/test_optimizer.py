@@ -139,3 +139,63 @@ def test_lam_fac_lowers_factor_variance():
     w1, i1 = optimize_month(m, {}, 0.0, 0.0, cfg, lam_fac=3000.0, risk=(sectors, L))
     _check(m, w1, i1)
     assert fvar(w1) < fvar(w0)
+
+
+def _v2_setup(seed=10, n=1500, **cfg_over):
+    r = np.random.default_rng(seed)
+    cfg = dict(CFG, risk_factors=["a", "b"], **cfg_over)
+    m = _month(seed=seed, n=n, size=True).with_columns(
+        a=pl.Series(r.uniform(-1, 1, n)), b=pl.Series(r.uniform(-1, 1, n)), spec_var=pl.Series(r.uniform(1e-4, 4e-4, n)))
+    sectors = sorted(m["sector"].unique().to_list())
+    k = 3 + len(sectors)
+    L = np.linalg.cholesky(np.eye(k) * 1e-3)
+    b = r.normal(size=k) * 0.3
+    return m, cfg, (sectors, L, b, 0.1)
+
+
+def _v2_check(m, cfg, risk, w):
+    from src.risk import risk_exposures
+    d = m.filter(pl.col("permno").is_in(list(w))).sort("permno")
+    ww = np.array([w[p] for p in d["permno"]])
+    X = risk_exposures(d, risk[0], cfg)
+    assert len(w) <= 500 and np.abs(ww).max() <= cfg["v2_max_weight"] + 1e-7 and np.abs(ww).sum() <= cfg["gross"] + 1e-6
+    assert abs(ww.sum()) <= cfg["net_band"] + 1e-6
+    assert abs(d["size_z"].to_numpy() @ ww) <= cfg["size_band"] + 1e-6
+    for _, g in d.group_by("sector"):
+        assert abs(sum(w[p] for p in g["permno"])) <= cfg["sector_band"] + 1e-6
+    var = np.sum((risk[1].T @ X.T @ ww) ** 2) + np.sum(d["spec_var"].to_numpy() * ww ** 2)
+    return float(np.sqrt(12 * var)), abs(float((X @ risk[2]) @ ww))
+
+
+def test_v2_constraints_and_more_names():
+    from src.optimizer import optimize_month_v2
+    m, cfg, risk = _v2_setup()
+    w, info = optimize_month_v2(m, {}, cfg, risk, 0.05)
+    vol, beta = _v2_check(m, cfg, risk, w)
+    assert info["status"] in ("optimal", "optimal_inaccurate") and not info["relaxed"]
+    assert vol <= cfg["v2_vol_target"] + 1e-6 and beta <= cfg["v2_beta_tol"] + 1e-6 and abs(vol - info["vol"]) < 1e-9
+    w1, _ = optimize_month(m, {}, 0.0, 0.0, CFG)
+    assert len(w) > len(w1) and info["n_long"] > 0 and info["n_short"] > 0
+
+
+def test_v2_cost_reduces_turnover():
+    from src.optimizer import optimize_month_v2
+    m, cfg, risk = _v2_setup(seed=11)
+    w0, _ = optimize_month_v2(m, {}, cfg, risk, 0.05)
+    m2, _, _ = _v2_setup(seed=12)
+    _, i_free = optimize_month_v2(m2, w0, dict(cfg, v2_cost=0.0), risk, 0.05)
+    _, i_cost = optimize_month_v2(m2, w0, dict(cfg, v2_cost=0.01), risk, 0.05)
+    assert i_cost["turnover"] < i_free["turnover"]
+
+
+def test_v2_vol_relaxed_and_run_book():
+    from src.optimizer import optimize_month_v2, run_book_v2
+    m, cfg, risk = _v2_setup(seed=13)
+    w, info = optimize_month_v2(m, {}, dict(cfg, v2_vol_target=0.005), risk, 0.05)
+    # w = 0 is always feasible (gross is an upper bound), so a tight vol target shrinks the book rather than forcing a relaxation
+    assert info["vol"] <= 0.005 + 1e-6 and info["gross"] < 2 and info["status"] in ("optimal", "optimal_inaccurate")
+    m2, _, _ = _v2_setup(seed=14)
+    m2 = m2.with_columns(eom=pl.lit(date(2020, 2, 29)))
+    rm = {"sectors": risk[0], "L": {date(2020, 1, 31): risk[1]}, "xs_vol": {date(2020, 1, 31): 0.1, date(2020, 2, 29): 0.1}}
+    wdf, log = run_book_v2(pl.concat([m, m2]), cfg, rm, 0.05)
+    assert wdf["eom"].n_unique() == 2 and len(log) == 2 and log[1]["vol"] is None

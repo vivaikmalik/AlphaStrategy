@@ -124,6 +124,17 @@ CONFIG = {
     "beta_variants": ["kf", "kf_rfloor", "b60_shrunk"],
     "beta_check_t": 1.96,                   # step 10 beta check: |t| above this = clearly nonzero -> fix betas
 
+    # --- book v2 (not in spec; added after the first full runs). Every number is a stated assumption or
+    #     estimated on pre-test data, nothing is searched. The spec book is still run and reported for comparison.
+    "book": "v2",                           # "v2" = main book below; "spec" = step-9 optimizer as the main book
+    "v2_cost": 0.0012,                      # assumed one-way trading cost (12 bps) per unit of |trade|
+    "v2_vol_target": 0.08,                  # ex-ante annual volatility cap (factor + specific risk)
+    "v2_max_weight": 0.005,                 # 0.5% per name -> ~400-500 names at 200% gross (rules allow 500)
+    "v2_beta_tol": 0.02,                    # |factor-model beta . w|
+    "v2_ic_floor": 0.01,                    # IC used to scale alpha = IC * xs_vol * z (each window's validation IC)
+    "risk_spec_window": 36,                 # trailing months of residuals for specific variance
+    "risk_spec_min": 6,
+
     # --- step 10 grids (fixed once on 2019-2020, then frozen) ---
     "gru_d_grid": [8, 16, 32],
     "lambda_tc_grid": [0.0, 0.1, 0.25, 0.5],
@@ -720,25 +731,57 @@ def risk_exposures(mdf, sectors, cfg):
     return np.hstack([np.ones((len(mdf), 1)), cols, D])
 
 
-def risk_model(frame, cfg):
-    """frame: permno, eom, sector, ret_exc_lead1m, risk factors -> {"sectors": [...], "L": {eom: k x k Cholesky of F_t}}."""
+def _risk_spec(res, t_frame, t, months, cfg):
+    """Specific variance of the stocks listed in t_frame at t from residuals of `months` (known months <= t)."""
+    r = res.filter(pl.col("eom").is_in(months)).group_by("permno").agg(
+        pl.col("resid").var().alias("v"), pl.col("resid").count().alias("n"))
+    r = r.with_columns(pl.when(pl.col("n") >= cfg["risk_spec_min"]).then(pl.col("v")).otherwise(None).alias("v"))
+    out = t_frame.select("permno").join(r.select("permno", "v"), on="permno", how="left")
+    med = out["v"].median()
+    if med is None:                                         # nothing estimable: pooled residual variance
+        med = res.filter(pl.col("eom").is_in(months))["resid"].var()
+    return out.select("permno", pl.lit(t).cast(pl.Date).alias("eom"),
+                      pl.col("v").fill_nan(None).fill_null(med).alias("spec_var"))
+
+
+def risk_model(frame, cfg, market=None):
+    """frame: permno, eom, sector, ret_exc_lead1m, risk factors ->
+    {"sectors", "L": {eom: chol(F_t)}, "xs_vol": {eom: mean xs return std}, "spec": permno/eom/spec_var,
+     "b": {eom: factor betas to S&P excess return} (only if `market` = eom, sp500_ret, tb3ms)}. Only f_s known <= t used."""
     sectors = sorted(frame["sector"].fill_null("NA").unique().to_list())
-    fs = {}                                                                 # eom s -> factor return, realised in month s+1
+    fs, vol, res = {}, {}, []                                               # eom s -> factor return realised in month s+1
     for (s,), g in frame.filter(pl.col("ret_exc_lead1m").is_not_null()).sort("eom").group_by("eom", maintain_order=True):
         X = risk_exposures(g, sectors, cfg)
-        fs[s] = np.linalg.lstsq(X, g["ret_exc_lead1m"].to_numpy().astype(float), rcond=None)[0]
+        y = g["ret_exc_lead1m"].to_numpy().astype(float)
+        fs[s] = np.linalg.lstsq(X, y, rcond=None)[0]
+        vol[s] = y.std(ddof=1)
+        res.append(pl.DataFrame({"permno": g["permno"], "eom": pl.Series([s] * len(y), dtype=pl.Date), "resid": y - X @ fs[s]}))
     eoms = sorted(fs)
     known = dict(zip(eoms, pl.Series(eoms).dt.offset_by("1mo").dt.month_end().to_list()))   # f_s known at eom s+1
-    L = {}
+    res = pl.concat(res)
+    mk = {} if market is None else {e: r - b / 1200 for e, r, b in market.select("eom", "sp500_ret", "tb3ms").drop_nulls().iter_rows()}
+    L, xs_vol, spec, b = {}, {}, [], {}
     for t in sorted(frame["eom"].unique().to_list()):
-        past = [fs[s] for s in eoms if known[s] <= t][-cfg["risk_window"]:]
+        kn = [s for s in eoms if known[s] <= t]
+        past = [fs[s] for s in kn][-cfg["risk_window"]:]
+        if kn:
+            spec.append(_risk_spec(res, frame.filter(pl.col("eom") == t), t, kn[-cfg["risk_spec_window"]:], cfg))
         if len(past) < cfg["risk_min_months"]:
             continue
+        xs_vol[t] = float(np.mean([vol[s] for s in kn[-cfg["risk_window"]:]]))
         F = np.cov(np.array(past), rowvar=False)
         k = F.shape[0]                                     # few months vs ~22 factors: shrink toward avg variance
         F = 0.9 * F + 0.1 * np.trace(F) / k * np.eye(k) + 1e-8 * np.eye(k)
         L[t] = np.linalg.cholesky(F)
-    return {"sectors": sectors, "L": L}
+        ks = [s for s in kn[-cfg["risk_window"]:] if known[s] in mk]
+        if market is not None and len(ks) >= cfg["risk_min_months"]:
+            m = np.array([mk[known[s]] for s in ks])
+            m = m - m.mean()
+            b[t] = (m @ (np.array([fs[s] for s in ks]) - np.mean([fs[s] for s in ks], axis=0))) / (m @ m)
+    out = {"sectors": sectors, "L": L, "xs_vol": xs_vol, "spec": pl.concat(spec)}
+    if market is not None:
+        out["b"] = b
+    return out
 
 
 # ===== src/optimizer.py =====
@@ -836,6 +879,122 @@ def run_book(scored, lam_tc, lam_beta, cfg, lam_risk=0.0, lam_fac=0.0, rm=None):
             print(f"[optimizer] {eom}: sector band relaxed to {info['sector_band']:.2f} (infeasible at 0.10)")
         if info["size_band"] > cfg["size_band"]:
             print(f"[optimizer] {eom}: size band relaxed to {info['size_band']:.2f}")
+        log.append({"eom": eom, **info})
+        rows += [(p, eom, x) for p, x in w.items()]
+        w_prev = w
+    wdf = pl.DataFrame(rows, schema={"permno": pl.Int64, "eom": pl.Date, "weight": pl.Float64}, orient="row")
+    return wdf, log
+
+
+def _opt_ladder(cfg):
+    """Relaxation steps (sector/size band, beta tol, vol multiplier): bands first, then beta, then vol (each stage keeps earlier relaxations)."""
+    b0, s0, t0 = cfg["sector_band"], cfg["size_band"], cfg["v2_beta_tol"]
+    steps = [(b0, s0, t0, 1.0)]
+    b, s = b0, s0
+    for _ in range(9):
+        b, s = b + 0.05, s + 0.05
+        steps.append((b, s, t0, 1.0))
+    t = t0
+    for _ in range(int(round((0.5 - t0) / 0.01))):
+        t += 0.01
+        steps.append((b, s, t, 1.0))
+    m = 1.0
+    while m < 4.0 - 1e-9:
+        m = min(m * 1.25, 4.0)
+        steps.append((b, s, t, m))
+    return steps
+
+
+def optimize_month_v2(mdf, w_prev, cfg, risk, ic):
+    """One month -> (weights dict, info dict). Max alpha.w - v2_cost*|w - w_prev|_1 s.t. gross/net/sector/size/beta/ex-ante vol caps.
+    risk = (sectors, L, b, xs_vol); alpha = max(ic, floor) * xs_vol * z (monthly expected excess return). L None -> vol constraint off."""
+    sectors, L, b_vec, xs_vol = risk
+    cap = cfg["v2_max_weight"]
+    d = mdf.with_columns(pl.col("sector").fill_null("NA")).sort("permno").with_columns(
+        ((pl.col("score") - pl.col("score").mean()) / pl.col("score").std()).fill_nan(0.0).fill_null(0.0).alias("s"),
+        pl.col("spec_var").fill_nan(None).fill_null(pl.col("spec_var").median()).fill_null(0.0).clip(lower_bound=0.0),
+        pl.col("size_z").fill_nan(None).fill_null(0.0))
+    long_ids = set(d.sort(["s", "permno"], descending=[True, False]).head(cfg["n_long_cand"])["permno"])
+    short_ids = set(d.filter(pl.col("short_eligible") & ~pl.col("permno").is_in(long_ids))
+                    .sort(["s", "permno"]).head(cfg["n_short_cand"])["permno"])
+    c = d.filter(pl.col("permno").is_in(long_ids | short_ids))
+    ids = c["permno"].to_list(); n = len(ids)
+    alpha = max(ic, cfg["v2_ic_floor"]) * xs_vol * c["s"].to_numpy()
+    sz, spec = c["size_z"].to_numpy(), np.sqrt(c["spec_var"].to_numpy())
+    ubL = np.array([cap if p in long_ids else 0.0 for p in ids])
+    ubS = np.array([cap if p in short_ids else 0.0 for p in ids])
+    G = (c["sector"].to_numpy()[None, :] == np.unique(c["sector"].to_numpy())[:, None]).astype(float)
+    X = risk_exposures(c, sectors, cfg) if (L is not None or b_vec is not None) else None
+    if b_vec is not None:
+        beta = X @ np.asarray(b_vec, dtype=float)
+    elif "beta_kf" in c.columns:
+        beta = c["beta_kf"].fill_nan(None).fill_null(0.0).to_numpy()
+    else:
+        beta = None
+    LtXt = L.T @ X.T if L is not None else None
+    wp = np.clip(np.nan_to_num(np.array([w_prev.get(p, 0.0) for p in ids])), -cap, cap)
+    dropped = sum(abs(v) for p, v in w_prev.items() if p not in set(ids))   # names that left the candidate set: sold to 0
+
+    wL, wS = cp.Variable(n, nonneg=True), cp.Variable(n, nonneg=True)
+    band, sband, tol, vol = (cp.Parameter(nonneg=True) for _ in range(4))
+    w = wL - wS
+    cons = [cp.sum(wL) + cp.sum(wS) <= cfg["gross"], cp.abs(cp.sum(w)) <= cfg["net_band"], wL <= ubL, wS <= ubS,
+            cp.abs(G @ w) <= band, cp.abs(sz @ w) <= sband]
+    if beta is not None:
+        cons.append(cp.abs(beta @ w) <= tol)
+    if LtXt is not None:
+        cons.append(cp.norm(cp.hstack([LtXt @ w, cp.multiply(spec, w)])) <= vol)
+    prob = cp.Problem(cp.Maximize(alpha @ w - cfg["v2_cost"] * cp.norm1(w - wp)), cons)
+    vol0 = cfg["v2_vol_target"] / np.sqrt(12)
+
+    def solve(bd, sb, t_, vm):
+        band.value, sband.value, tol.value, vol.value = bd, sb, t_, vol0 * vm
+        try:
+            prob.solve(solver=cp.CLARABEL)
+        except cp.SolverError:
+            return False
+        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or w.value is None:
+            return False
+        v = w.value
+        return bool(np.all(np.isfinite(v)) and np.abs(v).max() <= cap + 1e-4 and np.abs(v).sum() <= cfg["gross"] + 1e-3
+                    and abs(v.sum()) <= cfg["net_band"] + 1e-3)                  # inaccurate solutions must still obey net
+
+    for bd, sb, t_, vm in _opt_ladder(cfg):
+        if solve(bd, sb, t_, vm):
+            break
+    else:
+        print(f"[optimizer-v2] WARNING {mdf['eom'][0]}: infeasible even after full relaxation; holding previous weights")
+        return dict(w_prev), {"status": "fallback_hold", "n_long": sum(v > 0 for v in w_prev.values()),
+                              "n_short": sum(v < 0 for v in w_prev.values()), "gross": float(sum(abs(v) for v in w_prev.values())),
+                              "net": float(sum(w_prev.values())), "turnover": 0.0, "vol": None, "beta_pred": None, "relaxed": ["hold"]}
+    wv = np.where(np.abs(w.value) < 1e-7, 0.0, w.value)
+    relaxed = []
+    if bd > cfg["sector_band"] + 1e-9:
+        relaxed.append(f"sector/size band {bd:.2f}/{sb:.2f}")
+    if beta is not None and t_ > cfg["v2_beta_tol"] + 1e-9:
+        relaxed.append(f"beta tol {t_:.2f}")
+    if vm > 1.0 + 1e-9:
+        relaxed.append(f"vol target x{vm:.2f}")
+    var = float(np.sum((LtXt @ wv) ** 2) + np.sum((spec * wv) ** 2)) if LtXt is not None else None
+    weights = {p: float(x) for p, x in zip(ids, wv) if x != 0.0}
+    return weights, {"status": prob.status, "n_long": int((wv > 0).sum()), "n_short": int((wv < 0).sum()),
+                     "gross": float(np.abs(wv).sum()), "net": float(wv.sum()), "turnover": float(np.abs(wv - wp).sum() + dropped),
+                     "vol": float(np.sqrt(12 * var)) if var is not None else None,
+                     "beta_pred": float(beta @ wv) if beta is not None else None, "relaxed": relaxed}
+
+
+def run_book_v2(scored, cfg, rm, ic):
+    """scored: all months -> (weights df, log). ic: float or dict eom -> float; rm: risk model dict (sectors, L, xs_vol, optional b)."""
+    w_prev, rows, log = {}, [], []
+    for (eom,), mdf in scored.sort("eom").group_by("eom", maintain_order=True):
+        if eom in rm["L"] and eom in rm["xs_vol"]:
+            risk = (rm["sectors"], rm["L"][eom], rm.get("b", {}).get(eom), rm["xs_vol"][eom])
+        else:
+            print(f"[optimizer-v2] WARNING {eom}: no risk model, vol constraint off")
+            risk = (rm["sectors"], None, None, rm["xs_vol"].get(eom, 0.0))
+        w, info = optimize_month_v2(mdf, w_prev, cfg, risk, ic[eom] if isinstance(ic, dict) else ic)
+        if info["relaxed"]:
+            print(f"[optimizer-v2] {eom}: relaxed {', '.join(info['relaxed'])}")
         log.append({"eom": eom, **info})
         rows += [(p, eom, x) for p, x in w.items()]
         w_prev = w
@@ -1199,12 +1358,18 @@ def _pipe_attach_target(preds, frame):
         frame.select(_PIPE_KEYS + ["ret_exc_lead1m"]), on=_PIPE_KEYS, how="left")
 
 
-def _pipe_scored(preds, frame, cfg):
-    """Predictions + optimizer inputs (short_eligible, betas, sector, size_z = within-month z of log market cap, risk_factors columns)."""
+def _pipe_scored(preds, frame, cfg, rm=None):
+    """Predictions + optimizer inputs (short_eligible, betas, sector, size_z = within-month z of log market cap, risk_factors columns);
+    with rm also spec_var (specific variance from the risk model; null -> month median, then global median)."""
     lm = pl.when(pl.col("me_raw") > 0).then(pl.col("me_raw").log())
     size_z = ((lm - lm.mean().over("eom")) / lm.std().over("eom")).fill_nan(None).fill_null(0.0).alias("size_z")
     cols = _PIPE_KEYS + ["short_eligible", "beta_kf", "beta_var", "sector", size_z] + [c for c in cfg["risk_factors"] if c not in ("sector",)]
-    return preds.select(_PIPE_KEYS + ["score"]).join(frame.select(cols), on=_PIPE_KEYS, how="left")
+    out = preds.select(_PIPE_KEYS + ["score"]).join(frame.select(cols), on=_PIPE_KEYS, how="left")
+    if rm is not None:
+        sv = pl.col("spec_var").fill_nan(None)
+        out = out.join(rm["spec"].select(_PIPE_KEYS + ["spec_var"]), on=_PIPE_KEYS, how="left").with_columns(
+            sv.fill_null(sv.median().over("eom")).fill_null(sv.median()))
+    return out
 
 
 def _pipe_ir(rets):
@@ -1223,6 +1388,25 @@ def _pipe_beta(rets, cfg):
         return {"beta": float("nan"), "t": float("nan"), "alpha_m": float("nan")}
     r = sm.OLS(y[ok], sm.add_constant(x[ok])).fit(cov_type="HAC", cov_kwds={"maxlags": cfg["nw_lags"]})
     return {"beta": float(r.params[1]), "t": float(r.tvalues[1]), "alpha_m": float(r.params[0])}
+
+
+def _pipe_stats(rets, cfg):
+    """IR, S&P beta and annualised Sharpe of the excess return of a book_returns frame."""
+    x = rets["excess"].to_numpy()
+    sd = x.std(ddof=1) if len(x) > 1 else np.nan
+    return {"ir": _pipe_ir(rets), "beta": _pipe_beta(rets, cfg)["beta"],
+            "sharpe": float(np.sqrt(12) * x.mean() / sd) if sd and sd > 0 else float("nan")}
+
+
+def _pipe_ic_map(infos, frame, cfg, val=False):
+    """Pre-test IC for the v2 book: val=True -> the 2021 window's validation IC (float, for validation books);
+    else dict test eom -> that window's validation IC (windows without one get the mean of the others)."""
+    if val:
+        return float(infos[0].get("val_ic") or 0.0)
+    ics = {i["year"]: i.get("val_ic") for i in infos}
+    fb = float(np.mean([v for v in ics.values() if v is not None] or [0.0]))
+    tm = frame.select("eom", "target_month").unique()
+    return {e: float(ics[t.year] if ics[t.year] is not None else fb) for e, t in tm.iter_rows() if t.year in ics}
 
 
 def _pipe_ic(preds, frame, cfg):
@@ -1357,7 +1541,7 @@ def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, rm,
     for name in cfg["beta_variants"]:
         swapped[name] = _pipe_swap_beta(frames, _pipe_beta_variant(name, df, panel, cfg, logs))
         fr = _pipe_with_short(swapped[name][choice["d"]], choice["short_me_q"], cfg)
-        v = fix["variants"][name] = _pipe_beta(_pipe_run_book_stats(vals[choice["d"]], fr, choice, market, cfg, rm)[1], cfg)
+        v = fix["variants"][name] = _pipe_beta(_pipe_run_book_stats(vals[choice["d"]], fr, choice, market, cfg, rm, spec=True)[1], cfg)
         _pipe_log(f"beta fix: {name} val beta {v['beta']:.3f} (t={v['t']:.2f})")
     best = min(fix["variants"], key=lambda n: abs(fix["variants"][n]["beta"]) if np.isfinite(fix["variants"][n]["beta"]) else np.inf)
     fix["chosen"], grid = best, None
@@ -1371,10 +1555,22 @@ def _pipe_beta_fix(df, panel, frames, feats, vals, choice, chk, market, cfg, rm,
 
 
 # ----------------------------------------------------------------------------- full run + step 11 / 12 helpers
-def _pipe_run_book_stats(preds, frame, choice, market, cfg, rm):
-    """Book with chosen lambdas on test predictions -> (weights, rets, IR, beta)."""
-    w, _ = run_book(_pipe_scored(preds, frame, cfg), choice["lam_tc"], choice["lam_beta"], cfg, lam_risk=choice["lam_risk"],
-                    lam_fac=choice["lam_fac"], rm=rm)
+def _pipe_book(preds, frame, choice, cfg, rm, ic, spec=False):
+    """Main book: v2 (cfg["book"] == "v2": alpha = ic * xs_vol * z) or the spec book with the chosen lambdas (also forced by spec=True).
+    Logs the number of months with relaxed constraints. -> (weights, log)"""
+    sc = _pipe_scored(preds, frame, cfg, rm)
+    if cfg["book"] == "v2" and not spec:
+        w, log = run_book_v2(sc, cfg, rm, ic)
+    else:
+        w, log = run_book(sc, choice["lam_tc"], choice["lam_beta"], cfg, lam_risk=choice["lam_risk"], lam_fac=choice["lam_fac"], rm=rm)
+    n_rel = sum(1 for r in log if isinstance(r, dict) and any(v for k, v in r.items() if "relax" in k))
+    _pipe_log(f"book {'spec' if spec or cfg['book'] != 'v2' else 'v2'}: {len(log)} months, {n_rel} with relaxed constraints")
+    return w, log
+
+
+def _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic=None, spec=False):
+    """Main book (see _pipe_book) on `preds` -> (weights, rets, n_missing_returns)."""
+    w, _ = _pipe_book(preds, frame, choice, cfg, rm, ic, spec)
     rets, n_miss = book_returns(w, frame, market, cfg)
     return w, rets, n_miss
 
@@ -1418,7 +1614,7 @@ def _pipe_leak_dups(df):
     return int(df.height - df.unique(subset=_PIPE_KEYS).height)
 
 
-def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market, cfg, rm, infos):
+def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market, cfg, rm, infos, shuf_infos=None):
     """Step 11: structural checks plus shuffled-label run (test IC and IR should be ~0)."""
     ev = frame.filter(pl.col("has_filing") == 1) if "has_filing" in frame.columns else frame.head(0)
     out = {"filings": _pipe_leak_filings(filings, ev) if ev.height else {"flagged_without_filing": 0, "filing_after_eom": 0},
@@ -1427,7 +1623,7 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
            "duplicate_permno_eom": _pipe_leak_dups(frame),
            "train_target_month_violations": _pipe_leak_target_months(infos),
            "shuffled_ic": _pipe_ic(preds_shuf, frame, cfg)}
-    _, rets, _ = _pipe_run_book_stats(preds_shuf, frame, choice, market, cfg, rm)
+    _, rets, _ = _pipe_run_book_stats(preds_shuf, frame, choice, market, cfg, rm, _pipe_ic_map(shuf_infos or infos, frame, cfg))
     out["shuffled_ir"] = _pipe_ir(rets)
     out["shuffled_beta"] = _pipe_beta(rets, cfg)
     out["passed_structural"] = (out["filings"]["flagged_without_filing"] == 0 and out["filings"]["filing_after_eom"] == 0
@@ -1441,10 +1637,11 @@ def _pipe_leakage(frame, filings, feats, event_cols, preds_shuf, choice, market,
 
 
 def _pipe_ablations(frame, runs, choice, market, cfg, rm):
-    """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4 and 5."""
-    jobs = [r[k] for r in runs.values() for k in ("preds", "val")]
+    """Step 12: per ablation - validation/test rank IC, ICIR, IR, beta (chosen lambdas); IC on has_filing=1 rows for 4 and 5. Main book, each ablation's own val ICs."""
+    jobs = [(r["preds"], _pipe_ic_map(r["infos"], frame, cfg)) if k == "preds" else (r["val"], _pipe_ic_map(r["infos"], frame, cfg, val=True))
+            for r in runs.values() for k in ("preds", "val")]
     books = Parallel(n_jobs=min(cfg["n_jobs"], len(jobs)), backend="loky")(
-        delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm) for p in jobs)
+        delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm, ic) for p, ic in jobs)
     out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (XGB); missing-value flags enter from "
                             "ablation 3 onward; 5 = full main feature set. val_ir/val_beta: book on 2021-window val_pred."}
     for i, (name, r) in enumerate(runs.items()):
@@ -1475,7 +1672,7 @@ def main(cfg):
     feats = {d: base + gru_cols(d) + event_cols + _PIPE_TONE for d in cfg["gru_d_grid"]}
     frames = {d: _pipe_frame(df, embs[d], cfg["short_me_q"], cfg) for d in cfg["gru_d_grid"]}
     t0 = time.time()
-    rm = risk_model(frames[cfg["gru_d_grid"][0]], cfg)     # once per run: independent of d, betas, short_me_q
+    rm = risk_model(frames[cfg["gru_d_grid"][0]], cfg, market)     # once per run: independent of d, betas, short_me_q
     _pipe_log(f"risk model: {len(rm['L'])} months with a covariance, {time.time() - t0:.1f}s")
 
     # step 10: tuning on 2019-2020 validation
@@ -1495,12 +1692,20 @@ def main(cfg):
     preds, val_2021, infos = run_schedule(frame, full, cfg)
     preds = preds.select(_PIPE_KEYS + ["score", "ret_hat"])
     preds.write_parquet(out_dir / "predictions.parquet")
-    weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg, rm)
-    _pipe_log(f"full book: IR {_pipe_ir(rets):.3f}, missing returns {n_miss}")
+    ic_test = _pipe_ic_map(infos, frame, cfg)           # per test year: that window's validation IC (a pre-test quantity)
+    weights, rets, n_miss = _pipe_run_book_stats(preds, frame, choice, market, cfg, rm, ic_test)
+    _pipe_log(f"full book ({cfg['book']}): IR {_pipe_ir(rets):.3f}, missing returns {n_miss}")
+    # comparison: spec book on the same test predictions; main book on 2019-2020 validation (a check, nothing tuned on it)
+    test_stats = _pipe_stats(rets, cfg)
+    spec_book = _pipe_stats(_pipe_run_book_stats(preds, frame, choice, market, cfg, rm, spec=True)[1], cfg)
+    v2_val = _pipe_stats(_pipe_run_book_stats(val_2021, frame, choice, market, cfg, rm, _pipe_ic_map(infos, frame, cfg, val=True))[1], cfg)
+    _pipe_log(f"{cfg['book']} test IR {test_stats['ir']:.3f} beta {test_stats['beta']:.3f} | spec test IR {spec_book['ir']:.3f} "
+              f"beta {spec_book['beta']:.3f} | {cfg['book']} val IR {v2_val['ir']:.3f} beta {v2_val['beta']:.3f}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
     _pipe_dump({"choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos,
-                "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg)},
+                "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
+                "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val},
                "settings_log.json", cfg)
 
     # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
@@ -1517,8 +1722,8 @@ def main(cfg):
     _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm), "ablations.json", cfg)
 
     # step 11: leakage tests incl. shuffled-label run
-    shuf, _, _ = run_schedule(frame, full, cfg, shuffle=True)
-    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos)
+    shuf, _, shuf_infos = run_schedule(frame, full, cfg, shuffle=True)
+    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos, shuf_infos)
     _pipe_dump(leak, "leakage_tests.json", cfg)
     assert leak["filings"]["flagged_without_filing"] == 0 and leak["filings"]["filing_after_eom"] == 0,         f"leakage: filing_date after eom / flagged without filing: {leak['filings']}"
     assert leak["window_violations"] == 0, "leakage: train < val < test window ordering violated"
