@@ -119,7 +119,7 @@ CONFIG = {
     "kalman_r_floor": 0.05,                 # variant "kf_rfloor": lower bound on every R_j
     "beta_shrink": 0.33,                    # variant "b60_shrunk": (1-0.33)*beta_60m + 0.33*1
     "beta_variants": ["kf", "kf_rfloor", "b60_shrunk", "factor"],   # factor = risk-model predicted beta X.b
-    "beta_check_t": 0.0,                    # always run the beta fix: every validation book beta was negative (-0.12..-0.26) across runs; variant still chosen on 2019-2020 only
+    "beta_check_t": 1.96,                   # step 10 beta check: |t| above this = clearly nonzero -> fix betas (a 0.0 trigger was tested: worse validation beta, rejected)
 
     # --- book v2 (not in spec; added after the first full runs). Every number is a stated assumption or
     #     estimated on pre-test data, nothing is searched. The spec book is still run and reported for comparison.
