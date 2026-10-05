@@ -1,33 +1,279 @@
-import polars as pl
+"""Optimizer step 9 on synthetic months: every constraint, candidate sets, relaxation, turnover."""
+import time
+from datetime import date
 import numpy as np
-from src.optimizer import optimize_month
+import polars as pl
+from src.config import CONFIG
+from src.optimizer import optimize_month, run_book, run_book_v3
 
-def test_optimizer():
-    np.random.seed(42)
-    n = 600
+CFG = dict(CONFIG)
+
+
+def _month(n=1500, seed=0, eom=date(2020, 1, 31), beta_spread=0.3, size=False):
+    r = np.random.default_rng(seed)
     df = pl.DataFrame({
-        "permno": np.arange(1000, 1000 + n),
-        "score": np.random.randn(n),
-        "beta_kf": np.random.normal(1.0, 0.2, n),
-        "beta_var": np.abs(np.random.normal(0.05, 0.01, n)),
-        "sector": np.random.choice([10, 20, 30, 40], n),
-        "short_eligible": np.random.choice([0, 1], n, p=[0.2, 0.8])
-    })
-    
-    w_prev = {1000: 0.01}
-    weights = optimize_month(df, w_prev)
-    
-    assert len(weights) > 0, "Optimizer failed to find a solution"
-    
-    total_long = sum(w for w in weights.values() if w > 0)
-    total_short = sum(abs(w) for w in weights.values() if w < 0)
-    net_exposure = total_long - total_short
-    gross_exposure = total_long + total_short
-    
-    assert abs(gross_exposure - 2.0) < 1e-4, f"Gross exposure {gross_exposure} != 200%"
-    assert -0.2001 <= net_exposure <= 0.2001, f"Net exposure {net_exposure} outside 20% bounds"
-    assert all(abs(w) <= 0.01501 for w in weights.values()), "Weight exceeds 1.5% limit"
-    print("✅ CVXPY Clarabel Optimizer (Step 9) Verified.")
+        "permno": np.arange(n, dtype=np.int64) + 1, "eom": pl.Series([eom] * n, dtype=pl.Date), "score": r.normal(size=n),
+        "short_eligible": r.random(n) < 0.6, "beta_kf": 1 + beta_spread * r.normal(size=n),
+        "beta_var": r.uniform(0.005, 0.05, n), "sector": [str(10 + x) for x in r.integers(0, 11, n)]})
+    return df.with_columns(size_z=pl.Series(r.normal(size=n))) if size else df   # size_z only when asked (old tests)
 
-if __name__ == "__main__":
-    test_optimizer()
+
+def _check(mdf, w, info, tol=CFG["beta_tol"]):
+    d = mdf.filter(pl.col("permno").is_in(list(w))).with_columns(pl.col("permno").replace_strict(w, return_dtype=pl.Float64).alias("w"))
+    ww = d["w"].to_numpy()
+    assert abs(np.abs(ww).sum() - 2) < 1e-5
+    assert abs(ww.sum()) <= 0.2 + 1e-6
+    assert abs((d["beta_kf"].to_numpy() * ww).sum()) <= info["beta_tol"] + 1e-6
+    assert np.abs(ww).max() <= 0.015 + 1e-7 and len(w) >= 120
+    for _, g in d.group_by("sector"):
+        assert abs(g["w"].sum()) <= 0.1 + 1e-6
+    top = set(mdf.sort("score", descending=True).head(250)["permno"])
+    bot = set(mdf.filter(pl.col("short_eligible")).sort("score").head(250)["permno"])
+    assert all(p in top for p, x in w.items() if x > 0) and all(p in bot for p, x in w.items() if x < 0)
+
+
+def test_constraints_and_speed():
+    m = _month()
+    t0 = time.time()
+    w, info = optimize_month(m, {}, 0.1, 10.0, CFG)
+    assert time.time() - t0 < 5
+    _check(m, w, info)
+    assert info["status"] in ("optimal", "optimal_inaccurate") and info["beta_tol"] == CFG["beta_tol"]
+    assert info["n_long"] > 0 and info["n_short"] > 0 and abs(info["turnover"] - 2) < 1e-4  # from cash: sum|w| = 2
+
+
+def test_turnover_counts_dropped_names_and_tc_reduces_it():
+    m = _month(seed=1)
+    w0, _ = optimize_month(m, {}, 0.0, 0.0, CFG)
+    m2 = _month(seed=2)                                   # new scores: some old names leave the candidate set
+    wa, ia = optimize_month(m2, w0, 0.0, 0.0, CFG)
+    wb, ib = optimize_month(m2, w0, 0.5, 0.0, CFG)
+    assert ib["turnover"] < ia["turnover"]
+    gone = sum(abs(v) for p, v in w0.items() if p not in set(m2.sort("score", descending=True).head(250)["permno"]) and v > 0)
+    assert ia["turnover"] >= gone - 1e-6
+
+
+def test_beta_relaxation_logged():
+    m = _month(seed=3).with_columns(beta_kf=pl.when(pl.col("score") > 0).then(1.3).otherwise(0.9))   # longs 1.3 vs shorts 0.9: beta ~0.18 unavoidable
+    w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
+    _check(m, w, info)
+    assert info["beta_tol"] > CFG["beta_tol"]
+    # relaxation lands on the tolerance grid
+    k = (info["beta_tol"] - CFG["beta_tol"]) / CFG["beta_tol_step"]
+    assert abs(k - round(k)) < 1e-6
+
+
+def test_null_betas_and_run_book():
+    ms = [_month(seed=i, eom=e) for i, e in enumerate([date(2020, 1, 31), date(2020, 2, 29)])]
+    ms[0] = ms[0].with_columns(beta_kf=pl.when(pl.col("permno") % 50 == 0).then(None).otherwise(pl.col("beta_kf")))
+    wdf, log = run_book(pl.concat(ms), 0.1, 10.0, CFG)
+    assert wdf["eom"].n_unique() == 2 and len(log) == 2 and set(log[0]) >= {"beta_tol", "status", "n_long", "n_short", "turnover"}
+    assert log[1]["turnover"] > 0
+
+
+def test_sector_band_relaxed_when_infeasible():
+    # longs only in sector 10, shorts only in sector 20 -> +-0.10 sector nets cannot reach 200% gross
+    m = _month(n=1000, seed=3).with_columns(
+        pl.when(pl.col("score") > 0).then(pl.lit("10")).otherwise(pl.lit("20")).alias("sector"))
+    w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
+    assert info["sector_band"] > CFG["sector_band"] and info["status"] in ("optimal", "optimal_inaccurate")
+    assert abs(sum(abs(x) for x in w.values()) - 2) < 1e-5
+
+
+def test_constant_scores_do_not_crash():
+    m = _month(n=1000, seed=4).with_columns(pl.lit(0.5).alias("score"))
+    w, info = optimize_month(m, {}, 0.1, 10.0, CFG)
+    assert abs(sum(abs(x) for x in w.values()) - 2) < 1e-5
+
+
+def test_beta_relaxed_beyond_one_when_longs_are_high_beta():
+    # all long candidates beta ~3, all shorts ~0.5: min |beta.w| ~ 0.9*3 - 1.1*0.5 > 1, so tol must exceed 1.0
+    m = _month(n=1000, seed=5)
+    m = m.with_columns(pl.when(pl.col("score") > 0).then(3.0).otherwise(0.5).alias("beta_kf"))
+    w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
+    assert info["status"] in ("optimal", "optimal_inaccurate") and info["beta_tol"] > 1.0
+    _check(m, w, info) if info["sector_band"] == CFG["sector_band"] else None
+
+
+def test_garbage_previous_weight_does_not_poison_month():
+    m = _month(n=1500, seed=6)
+    w, _ = optimize_month(m, {}, 0.0, 1000.0, CFG)
+    bad = dict(w); bad[next(iter(bad))] = 1e12
+    w2, info = optimize_month(m, bad, 0.0, 1000.0, CFG)
+    assert info["status"] in ("optimal", "optimal_inaccurate") and info["sector_band"] == CFG["sector_band"]
+    _check(m, w2, info)
+
+
+def test_size_neutrality_constraint():
+    m = _month(seed=7, size=True)
+    w, info = optimize_month(m, {}, 0.0, 0.0, CFG)
+    _check(m, w, info)
+    d = m.filter(pl.col("permno").is_in(list(w))).sort("permno")
+    assert abs(sum(z * w[p] for p, z in zip(d["permno"], d["size_z"]))) <= CFG["size_band"] + 1e-6
+    assert info["size_band"] >= CFG["size_band"]
+
+
+def test_lam_risk_spreads_weights():
+    m = _month(seed=8)
+    w0, i0 = optimize_month(m, {}, 0.0, 0.0, CFG)
+    w1, i1 = optimize_month(m, {}, 0.0, 0.0, CFG, lam_risk=100.0)
+    _check(m, w1, i1)
+    assert len(w1) >= len(w0) and max(abs(x) for x in w1.values()) <= max(abs(x) for x in w0.values()) + 1e-9
+    assert len(w1) > len(w0) or max(abs(x) for x in w1.values()) < max(abs(x) for x in w0.values())
+
+
+def test_lam_fac_lowers_factor_variance():
+    from src.risk import risk_exposures
+    m = _month(seed=9)
+    r = np.random.default_rng(9)
+    cfg = dict(CFG, risk_factors=["a", "b"])
+    m = m.with_columns(a=pl.Series(r.uniform(-1, 1, m.height)), b=pl.Series(r.uniform(-1, 1, m.height)))
+    sectors = sorted(m["sector"].unique().to_list())
+    k = 3 + len(sectors)
+    L = np.linalg.cholesky(np.eye(k) * 1e-3)
+    def fvar(w):
+        d = m.filter(pl.col("permno").is_in(list(w))).sort("permno")
+        v = risk_exposures(d, sectors, cfg).T @ np.array([w[p] for p in d["permno"]])
+        return float(v @ (L @ L.T) @ v)
+    w0, _ = optimize_month(m, {}, 0.0, 0.0, cfg)
+    w1, i1 = optimize_month(m, {}, 0.0, 0.0, cfg, lam_fac=3000.0, risk=(sectors, L))
+    _check(m, w1, i1)
+    assert fvar(w1) < fvar(w0)
+
+
+def _v2_setup(seed=10, n=1500, **cfg_over):
+    r = np.random.default_rng(seed)
+    cfg = dict(CFG, risk_factors=["a", "b"], **cfg_over)
+    m = _month(seed=seed, n=n, size=True).with_columns(
+        a=pl.Series(r.uniform(-1, 1, n)), b=pl.Series(r.uniform(-1, 1, n)), spec_var=pl.Series(r.uniform(1e-4, 4e-4, n)))
+    sectors = sorted(m["sector"].unique().to_list())
+    k = 3 + len(sectors)
+    L = np.linalg.cholesky(np.eye(k) * 1e-3)
+    b = r.normal(size=k) * 0.3
+    return m, cfg, (sectors, L, b, 0.1)
+
+
+def _v2_check(m, cfg, risk, w):
+    from src.risk import risk_exposures
+    d = m.filter(pl.col("permno").is_in(list(w))).sort("permno")
+    ww = np.array([w[p] for p in d["permno"]])
+    X = risk_exposures(d, risk[0], cfg)
+    assert len(w) <= 500 and np.abs(ww).max() <= cfg["v2_max_weight"] + 1e-7 and np.abs(ww).sum() <= cfg["gross"] + 1e-6
+    assert abs(ww.sum()) <= cfg["net_band"] + 1e-6
+    assert abs(d["size_z"].to_numpy() @ ww) <= cfg["size_band"] + 1e-6
+    for _, g in d.group_by("sector"):
+        assert abs(sum(w[p] for p in g["permno"])) <= cfg["sector_band"] + 1e-6
+    var = np.sum((risk[1].T @ X.T @ ww) ** 2) + np.sum(d["spec_var"].to_numpy() * ww ** 2)
+    return float(np.sqrt(12 * var)), abs(float((X @ risk[2]) @ ww))
+
+
+def test_v2_constraints_and_more_names():
+    from src.optimizer import optimize_month_v2
+    m, cfg, risk = _v2_setup()
+    w, info = optimize_month_v2(m, {}, cfg, risk, 0.05)
+    vol, beta = _v2_check(m, cfg, risk, w)
+    assert info["status"] in ("optimal", "optimal_inaccurate") and not info["relaxed"]
+    assert vol <= cfg["v2_vol_target"] + 1e-6 and beta <= cfg["v2_beta_tol"] + 1e-6 and abs(vol - info["vol"]) < 1e-9
+    w1, _ = optimize_month(m, {}, 0.0, 0.0, CFG)
+    assert len(w) > len(w1) and info["n_long"] > 0 and info["n_short"] > 0
+
+
+def test_v2_cost_reduces_turnover():
+    from src.optimizer import optimize_month_v2
+    m, cfg, risk = _v2_setup(seed=11)
+    w0, _ = optimize_month_v2(m, {}, cfg, risk, 0.05)
+    m2, _, _ = _v2_setup(seed=12)
+    _, i_free = optimize_month_v2(m2, w0, dict(cfg, v2_cost=0.0), risk, 0.05)
+    _, i_cost = optimize_month_v2(m2, w0, dict(cfg, v2_cost=0.01), risk, 0.05)
+    assert i_cost["turnover"] < i_free["turnover"]
+
+
+def test_v2_vol_relaxed_and_run_book():
+    from src.optimizer import optimize_month_v2, run_book_v2
+    m, cfg, risk = _v2_setup(seed=13)
+    w, info = optimize_month_v2(m, {}, dict(cfg, v2_vol_target=0.005), risk, 0.05)
+    # w = 0 is always feasible (gross is an upper bound), so a tight vol target shrinks the book rather than forcing a relaxation
+    assert info["vol"] <= 0.005 + 1e-6 and info["gross"] < 2 and info["status"] in ("optimal", "optimal_inaccurate")
+    m2, _, _ = _v2_setup(seed=14)
+    m2 = m2.with_columns(eom=pl.lit(date(2020, 2, 29)))
+    rm = {"sectors": risk[0], "L": {date(2020, 1, 31): risk[1]}, "xs_vol": {date(2020, 1, 31): 0.1, date(2020, 2, 29): 0.1}}
+    wdf, log = run_book_v2(pl.concat([m, m2]), cfg, rm, 0.05)
+    assert wdf["eom"].n_unique() == 2 and len(log) == 2 and log[1]["vol"] is None
+
+
+def test_book_v3():
+    cfg = {**CFG, "v3_tail": 0.05}
+    ms = [_month(n=3000, seed=i, eom=date(2020, i + 1, 28)) for i in range(3)]
+    sc = pl.concat(ms)
+    w, log = run_book_v3(sc, cfg, 0.5)
+    for m, lg in zip(ms, log):
+        d = w.filter(pl.col("eom") == m["eom"][0]).join(m, on="permno")
+        ww, b = d["weight"].to_numpy(), d["beta_kf"].to_numpy()
+        assert abs(ww.sum() - lg["net"]) < 1e-9 and abs(np.abs(ww).sum() - 2) < 1e-6 and abs(ww.sum()) <= 0.2 + 1e-6
+        assert len(ww) <= 500
+        if "net_clipped" not in lg["flags"] and "max_weight_capped" not in lg["flags"]:
+            assert abs((ww * b).sum()) < 1e-6
+            L, S = ww[ww > 0].sum(), -ww[ww < 0].sum()
+            for sname, g in d.group_by("sector"):
+                budget = (m["sector"] == sname[0]).sum() / m.height
+                assert abs(g["weight"].sum() - (L - S) * budget) < 1e-6
+    # no look-ahead: changing the last month leaves earlier weights unchanged
+    sc2 = pl.concat(ms[:2] + [ms[2].with_columns(score=-pl.col("score"))])
+    w2, _ = run_book_v3(sc2, cfg, 0.5)
+    k = date(2020, 2, 28)
+    assert w.filter(pl.col("eom") <= k).sort(["eom", "permno"]).equals(w2.filter(pl.col("eom") <= k).sort(["eom", "permno"]))
+
+
+# ---- book v4 ----
+def _v4_data(n=1200, months=40, seed=3):
+    r = np.random.default_rng(seed)
+    eoms = [date(2018 + (m // 12), m % 12 + 1, 28) for m in range(months)]
+    pm = np.arange(1, n + 1, dtype=np.int64)
+    rets = pl.DataFrame({"permno": np.tile(pm, months), "eom": pl.Series([e for e in eoms for _ in pm], dtype=pl.Date),
+                         "ret": 0.10 * r.normal(size=n * months)})
+    grp = r.choice(["nano", "micro", "small", "large", "mega"], n)
+    tail = [eoms[-2], eoms[-1]]
+    sc = pl.concat([pl.DataFrame({"permno": pm, "eom": pl.Series([e] * n, dtype=pl.Date), "score": r.normal(size=n),
+                                  "short_eligible": r.random(n) < 0.7, "beta_60m_raw": 1 + 0.4 * r.normal(size=n),
+                                  "size_grp": grp}) for e in tail])
+    return sc, rets, tail
+
+
+def test_v4_constraints():
+    from src.optimizer import run_book_v4
+    sc, rets, tail = _v4_data()
+    G = 1.5
+    prm = {e: {"gross": G, "cov_window": 24, "risk_penalty": 3000.0, "turnover_penalty": 0.05} for e in tail}
+    w, log = run_book_v4(sc, CFG, prm, rets)
+    assert all(l["attempt"] == "main" for l in log), log
+    for e in tail:
+        d = sc.filter(pl.col("eom") == e).join(w.filter(pl.col("eom") == e), on=["permno", "eom"])
+        ww = d["weight"].to_numpy()
+        assert abs(ww.sum()) < 1e-6 and abs(np.abs(ww).sum() - G) < 1e-6
+        assert abs((d["beta_60m_raw"].to_numpy() * ww).sum()) <= 0.05 + 1e-6
+        assert 100 <= len(ww) <= 500
+        for g in d["size_grp"].unique():
+            assert abs(d.filter(pl.col("size_grp") == g)["weight"].sum()) <= 0.05 + 1e-6
+    assert abs(log[0]["turnover"] - G) < 1e-6 and log[1]["turnover"] > 0
+
+
+def test_v4_lw_no_lookahead_and_risk_penalty():
+    from src.risk import lw_factor, _risk_variance
+    from src.optimizer import run_book_v4
+    sc, rets, tail = _v4_data()
+    eom = date(2020, 1, 28)
+    pm = np.arange(1, 1201)
+    a = lw_factor(rets, eom, 24, pm)
+    r2 = rets.with_columns(ret=pl.when(pl.col("eom") > eom).then(9.0).otherwise(pl.col("ret")))
+    b = lw_factor(r2, eom, 24, pm)
+    assert a["T"] == 24 and np.array_equal(a["Xc"], b["Xc"]) and a["delta"] == b["delta"] and len(a["permnos"]) == 1200
+    c = lw_factor(rets.filter(~((pl.col("permno") == 5) & (pl.col("eom") == date(2019, 6, 28)))), eom, 24, pm)
+    assert 5 not in c["permnos"] and len(c["permnos"]) == 1199
+    last = sc.filter(pl.col("eom") == tail[-1])
+    fac = lw_factor(rets, tail[-1], 24, pm)
+    v = []
+    for rp in (3000.0, 30000.0):
+        w, _ = run_book_v4(last, CFG, {tail[-1]: {"gross": 1.5, "cov_window": 24, "risk_penalty": rp, "turnover_penalty": 0.0}}, rets)
+        idx = np.searchsorted(fac["permnos"], w["permno"].to_numpy())
+        v.append(_risk_variance(fac, w["weight"].to_numpy(), idx))
+    assert v[1] < v[0]

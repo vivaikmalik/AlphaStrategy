@@ -1,88 +1,179 @@
 """
-src/ranker.py - Step 5: XGBoost Ranker
-Trains an XGBoost regression model on original features + GRU embeddings.
-Outputs a cross-sectionally ranked alpha signal [-1, 1] for portfolio construction.
+src/ranker.py - Step 5: XGBRanker (rank:pairwise, qid = eom) with walk-forward windows, plus the Ridge baseline.
+Scores are cross-sectional only; ret_hat comes from a rank regression fitted on validation scores of the train-only model.
 """
+import calendar
+from datetime import date
 
+import numpy as np
 import polars as pl
 import xgboost as xgb
-import numpy as np
+from sklearn.linear_model import Ridge
 
-def train_and_rank(df: pl.DataFrame, factors: list, d: int, target_col: str = "ret_exc_lead1m"):
-    """
-    Trains XGBoost using early stopping on the 2019-2020 validation set.
-    Generates a cross-sectional alpha signal ranked strictly between -1 (Short) and 1 (Long).
-    """
-    # 1. Feature Assembly
-    gru_cols = [f"gru_{i+1}" for i in range(d)]
-    features = factors + gru_cols
-    
-    # 2. Data Cleaning - drop rows missing the target or GRU embeddings
-    df_clean = df.drop_nulls(subset=[target_col] + gru_cols)
-    
-    # 3. Chronological Splits
-    train_mask = df_clean["eom"] <= pl.date(2018, 11, 30)
-    val_mask = (df_clean["eom"] >= pl.date(2019, 1, 1)) & (df_clean["eom"] <= pl.date(2020, 12, 31))
-    
-    train_df = df_clean.filter(train_mask)
-    val_df = df_clean.filter(val_mask)
-    
-    X_train = train_df.select(features).to_pandas()
-    y_train = train_df.select(target_col).to_numpy().ravel()
-    
-    X_val = val_df.select(features).to_pandas()
-    y_val = val_df.select(target_col).to_numpy().ravel()
-    
-    print(f"Training XGBoost on {len(X_train)} samples, validating on {len(X_val)} samples...")
+from src.cfi import cfi_candidates, cfi_clusters, cfi_importance
 
-    # 4. Hyperparameter Grid Search
-    best_model = None
-    best_val_loss = float('inf')
-    best_params = {}
-    
-    for lr in [0.01, 0.05]:
-        for depth in [3, 5]:
-            # Bind to Grace Blackwell GPU via device="cuda"
-            model = xgb.XGBRegressor(
-                n_estimators=500,
-                learning_rate=lr,
-                max_depth=depth,
-                tree_method="hist",
-                device="cuda", 
-                eval_metric="rmse",
-                early_stopping_rounds=20
-            )
-            
-            model.fit(
-                X_train, y_train,
-                eval_set=[(X_val, y_val)],
-                verbose=False
-            )
-            
-            val_loss = model.best_score
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_model = model
-                best_params = {'lr': lr, 'depth': depth, 'rmse': val_loss}
 
-    print(f"Best XGBoost Params -> LR: {best_params['lr']} | Max Depth: {best_params['depth']} | Val RMSE: {best_params['rmse']:.4f}")
+def _rk_me(s):
+    """'YYYY-MM' -> month-end date."""
+    y, m = int(s[:4]), int(s[5:7])
+    return date(y, m, calendar.monthrange(y, m)[1])
 
-    # 5. Generate Raw Predictions for the entire dataset
-    print("Scoring universe and cross-sectionally ranking signals...")
-    X_all = df_clean.select(features).to_pandas()
-    df_clean = df_clean.with_columns(
-        pl.Series("raw_prediction", best_model.predict(X_all))
-    )
-    
-    # 6. Cross-Sectional Ranking (The Alpha Signal)
-    # Ranks the predictions dynamically within each month (eom)
-    # Scales the rank to exactly [-1, 1] where 1 is the highest predicted return
-    ranked = df_clean.with_columns([
-        pl.col("raw_prediction").rank(method="dense", descending=False).over("eom").alias("rank_temp")
-    ])
-    
-    final_df = ranked.with_columns([
-        ((pl.col("rank_temp") - 1) / (pl.col("rank_temp").max().over("eom") - 1) * 2 - 1).alias("alpha_signal")
-    ]).drop("rank_temp")
 
-    return final_df, best_model
+def windows(cfg):
+    """One dict per test year, by TARGET month: train 2015-02..Y-3, val Y-2..Y-1, test Y (2026 ends at last_test_month)."""
+    first, last = _rk_me(cfg["first_train_month"]), _rk_me(cfg["last_test_month"])
+    return [dict(year=y, train=(first, date(y - 3, 12, 31)), val=(date(y - 2, 1, 31), date(y - 1, 12, 31)),
+                 test=(date(y, 1, 31), min(date(y, 12, 31), last))) for y in cfg["test_years"]]
+
+
+def rank_ic(pred, cfg=None):
+    """Monthly Spearman IC of score vs ret_exc_lead1m (Pearson on within-month average ranks); null targets dropped."""
+    return (pred.drop_nulls("ret_exc_lead1m").group_by("eom")
+            .agg(pl.corr(pl.col("score").rank(), pl.col("ret_exc_lead1m").rank()).alias("ic")).sort("eom"))
+
+
+def _rk_mean_ic(eom, score, y):
+    """Mean monthly rank IC from numpy arrays (months with undefined IC are skipped)."""
+    ic = rank_ic(pl.DataFrame({"eom": eom, "score": score, "ret_exc_lead1m": y}))["ic"].drop_nans().drop_nulls()
+    return float(ic.mean()) if len(ic) else float("nan")
+
+
+def _rk_labels(eom, y):
+    """Within-month decile 0-9 of y: floor(10*(rank_ordinal-1)/n)."""
+    d = pl.DataFrame({"eom": eom, "y": y}).with_columns(
+        (10 * (pl.col("y").rank("ordinal").over("eom") - 1) // pl.len().over("eom")).cast(pl.Int32).alias("l"))
+    return d["l"].to_numpy()
+
+
+def _rk_shuffle(eom, y, seed):
+    """Permute y within each month (rows are sorted by eom, so blocks stay in place)."""
+    order = np.lexsort((np.random.default_rng(seed).random(len(y)), eom.to_numpy()))
+    return y[order]
+
+
+def _rk_ranks(eom, score):
+    """Within-month rank of score scaled to [-1, 1]."""
+    d = pl.DataFrame({"eom": eom, "s": score}).with_columns(
+        r=pl.col("s").rank().over("eom"), n=pl.len().over("eom"))
+    return d.select(pl.when(pl.col("n") > 1).then((pl.col("r") - 1) / (pl.col("n") - 1) * 2 - 1).otherwise(0.0))["r"].to_numpy()
+
+
+def _rk_mat(d, features):
+    return d.select(features).cast(pl.Float32).to_numpy()  # nulls -> NaN (XGBoost handles them natively)
+
+
+def _rk_xgb(cfg, depth, trees, X, y, e):
+    kw = dict(device="cuda") if cfg["device"] == "cuda" and xgb.build_info().get("USE_CUDA") else {}
+    m = xgb.XGBRanker(**cfg["xgb_fixed"], max_depth=depth, n_estimators=trees, random_state=cfg["seed"], **kw)
+    m.fit(X, _rk_labels(e, y), qid=e.cast(pl.Int32).to_numpy())
+    return m
+
+
+def _rk_tune(tr, va, feats, cfg, ytr, yva, grid=None):
+    """Fit on train per depth, eval val IC every eval_every trees. Returns (best_ic, depth, trees, model); fills grid if given."""
+    Xtr, Xva = _rk_mat(tr, feats), _rk_mat(va, feats)
+    best, best_m = (-np.inf, None, None), None
+    for depth in cfg["xgb_depth_grid"]:
+        m = _rk_xgb(cfg, depth, cfg["xgb_max_trees"], Xtr, ytr, tr["eom"])
+        for k in range(cfg["xgb_eval_every"], cfg["xgb_max_trees"] + 1, cfg["xgb_eval_every"]):
+            ic = _rk_mean_ic(va["eom"], m.predict(Xva, iteration_range=(0, k)), yva)
+            if grid is not None:
+                grid[f"{depth}_{k}"] = ic
+            if ic > best[0]:
+                best, best_m = (ic, depth, k), m
+    return best[0], best[1], best[2], best_m
+
+
+def _rk_cfi_select(tr, va, features, cfg, ytr, yva, base, cfi_factors):
+    """CFI selection on one window (train rows cluster, val rows rank groups). Returns (feats, tuned, info)."""
+    fset = set(cfi_factors)
+    facs = [f for f in features if f in fset]
+    bic, _, btrees, bm = base
+    pf = lambda X: bm.predict(X, iteration_range=(0, btrees))
+    clusters, cands, seen = cfi_clusters(tr, facs, cfg), [], set()
+    for cut, groups in clusters.items():
+        imps = cfi_importance(pf, va, features, groups, cfg)
+        for share in cfg["cfi_shares"]:
+            sub = cfi_candidates(groups, imps, [share])[0]
+            key = frozenset(sub)
+            if key in seen:
+                continue
+            seen.add(key)
+            sel = [f for f in features if f in key or f not in fset]
+            t = _rk_tune(tr, va, sel, cfg, ytr, yva)
+            cands.append(dict(name=f"cut{cut:.2f}_top{round(share * 100)}", n_factors=len(key), val_ic=t[0], feats=sel, tuned=t))
+    best = None
+    for c in cands:  # strictly better IC wins; exact ties -> fewer features
+        if np.isfinite(c["val_ic"]) and (best is None or (c["val_ic"], -c["n_factors"]) > (best["val_ic"], -best["n_factors"])):
+            best = c
+    use = best is not None and (not np.isfinite(bic) or best["val_ic"] > bic)
+    info = dict(chosen=best["name"] if use else "all", n_factors=best["n_factors"] if use else len(facs),
+                val_ic_base=bic, val_ic_chosen=best["val_ic"] if use else bic,
+                candidates=[dict(name=c["name"], n_factors=c["n_factors"], val_ic=c["val_ic"]) for c in cands])
+    return (best["feats"], best["tuned"], info) if use else (features, base, info)
+
+
+def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False, cfi_factors=None):
+    """Tune on val (train-only fits), refit on train+val, predict the test year. Returns (test_pred, val_pred, info)."""
+    df = df.sort(["eom", "permno"])
+    rng = lambda w: (pl.col("target_month") >= w[0]) & (pl.col("target_month") <= w[1])
+    has_y = pl.col("ret_exc_lead1m").is_not_null()
+    tr, va = df.filter(rng(win["train"]) & has_y), df.filter(rng(win["val"]) & has_y)
+    te = df.filter(rng(win["test"]))
+    va_all = df.filter(rng(win["val"]))  # incl. null-target rows: val_pred must cover every validation month-row
+    ytr, yva = tr["ret_exc_lead1m"].to_numpy(), va["ret_exc_lead1m"].to_numpy()
+    if shuffle:  # leakage test: destroy the label-feature link in train AND val
+        ytr, yva = _rk_shuffle(tr["eom"], ytr, cfg["seed"]), _rk_shuffle(va["eom"], yva, cfg["seed"] + 1)
+    cfi_info = None
+    if model == "xgb":
+        grid = {}
+        tuned = _rk_tune(tr, va, features, cfg, ytr, yva, grid)
+        if cfi_factors is not None and cfg.get("cfi_enabled"):
+            features, tuned, cfi_info = _rk_cfi_select(tr, va, features, cfg, ytr, yva, tuned, cfi_factors)
+    Xtr, Xva, Xte = _rk_mat(tr, features), _rk_mat(va, features), _rk_mat(te, features)
+    Xall, yall = np.vstack([Xtr, Xva]), np.concatenate([ytr, yva])
+    eall = pl.concat([tr["eom"], va["eom"]])
+
+    if model == "xgb":
+        best, best_m = tuned[:3], tuned[3]
+        val_score = best_m.predict(Xva, iteration_range=(0, best[2]))
+        final = _rk_xgb(cfg, best[1], best[2], Xall, yall, eall)
+        te_score = final.predict(Xte)
+        va_all_score = best_m.predict(_rk_mat(va_all, features), iteration_range=(0, best[2]))
+    else:  # ridge baseline on the features (template: Ridge on the 147 characteristics)
+        grid, best = {}, (-np.inf, None, None)
+        Xtr0, Xva0, Xte0, Xall0 = (np.nan_to_num(x) for x in (Xtr, Xva, Xte, Xall))
+        for a in cfg["ridge_alpha_grid"]:
+            rm = Ridge(alpha=a).fit(Xtr0, ytr)
+            s = rm.predict(Xva0)
+            ic = _rk_mean_ic(va["eom"], s, yva)
+            grid[str(a)] = ic
+            if ic > best[0]:
+                best, val_score, best_m = (ic, a, None), s, rm
+        te_score = Ridge(alpha=best[1]).fit(Xall0, yall).predict(Xte0)
+        va_all_score = best_m.predict(np.nan_to_num(_rk_mat(va_all, features)))
+
+    # ret_hat: linear regression of realised return on the within-month score rank, fitted on val scores of the train-only model
+    slope, icpt = np.polyfit(_rk_ranks(va["eom"], val_score), yva, 1)
+    out = lambda d, s: d.select("permno", "eom").with_columns(
+        score=pl.Series(s, dtype=pl.Float64),
+        ret_hat=pl.Series(icpt + slope * _rk_ranks(d["eom"], s), dtype=pl.Float64))
+    info = dict(year=win["year"], model=model, best_depth=best[1] if model == "xgb" else None,
+                best_trees=best[2], val_ic=best[0], grid=grid,
+                train_max_target=max(tr["target_month"].max(), va["target_month"].max()))  # step 11 check
+    if cfi_info is not None:
+        info["cfi"], info["features"] = cfi_info, list(features)
+    if model == "ridge":
+        info["best_alpha"] = best[1]
+    return out(te, te_score), out(va_all, va_all_score), info
+
+
+def run_schedule(df, features, cfg, model="xgb", shuffle=False, return_vals=False, cfi_factors=None):
+    """Loop over test years. Returns (preds, val_2021, infos); with return_vals a 4th value {year: that window's val_pred}."""
+    tests, infos, val_2021, vals = [], [], None, {}
+    for w in windows(cfg):
+        t, v, i = fit_predict_year(df, features, w, cfg, model, shuffle, cfi_factors)
+        tests.append(t); infos.append(i); vals[w["year"]] = v
+        if w["year"] == 2021:
+            val_2021 = v
+    return (pl.concat(tests), val_2021, infos, vals) if return_vals else (pl.concat(tests), val_2021, infos)
