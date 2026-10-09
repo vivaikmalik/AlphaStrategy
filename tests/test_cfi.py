@@ -9,7 +9,7 @@ from src.cfi import _cfi_perm, cfi_candidates, cfi_clusters, cfi_importance
 from src.config import CONFIG
 from src.ranker import fit_predict_year, windows
 
-CFG = {**CONFIG, "device": "cpu", "xgb_max_trees": 60, "xgb_depth_grid": [3], "test_years": [2021],
+CFG = {**CONFIG, "ranker_model": "xgb", "device": "cpu", "xgb_max_trees": 60, "xgb_depth_grid": [3], "test_years": [2021],
        "cfi_min_pairs": 20, "cfi_min_months": 3, "cfi_cuts": [0.75], "cfi_shares": [0.34, 0.67], "cfi_repeats": 2,
        "xgb_fixed": {**CONFIG["xgb_fixed"], "min_child_weight": 1, "learning_rate": 0.1}}
 FACS = ["f0", "f1", "f2", "f3", "f4", "f5"]  # f1 == f0 (+tiny noise); f0 carries the signal

@@ -69,7 +69,11 @@ CONFIG = {
     "gru_patience": 5,
     "gru_clip": 1.0,
 
-    # --- step 5 XGBoost ranker ---
+    # --- step 5 ranker (XGBoost remains available for comparison) ---
+    "ranker_model": "tabpfn",
+    "tabpfn_n_estimators": 4,
+    "tabpfn_max_train_samples": 1000 if SMOKE or _DEVICE == "cpu" else 10000,
+    "tabpfn_predict_batch": 1024,
     "xgb_fixed": dict(objective="rank:pairwise", learning_rate=0.03, subsample=0.7,
                       colsample_bytree=0.5, min_child_weight=200, reg_lambda=10, tree_method="hist",
                       # xgboost>=2 normalises pairwise gradients by default -> hessians so small that

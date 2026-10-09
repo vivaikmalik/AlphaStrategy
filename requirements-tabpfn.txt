@@ -1,0 +1,19 @@
+# Runtime and synthetic-test dependencies for the TabPFN pipeline.
+tabpfn==9.1.0
+numpy
+polars
+pandas
+pyarrow
+torch
+scipy
+scikit-learn
+statsmodels
+joblib
+cvxpy
+clarabel
+transformers
+matplotlib
+requests
+pytest
+# Optional comparison ranker and its existing regression tests.
+xgboost>=2.0

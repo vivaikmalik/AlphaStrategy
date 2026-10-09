@@ -44,7 +44,7 @@ HEADER = """# MAIN.py - AlphaStrategy, McGill-FIAM Asset Management Hackathon 20
 #     GRU autoencoder embeddings of each stock's last 11 monthly changes (trained up to 2018).
 #  4. Walk-forward: for test year Y train on 2015-02..(Y-3)-12, validate on (Y-2)..(Y-1),
 #     feature selection on the 147 characteristics (clusters + permutation importance on validation),
-#     XGBoost ranker, refit on train + validation, predict year Y. Test years 2021-2026.
+#     TabPFN return-rank regressor (optional XGBoost), refit on train + validation, predict year Y. Test years 2021-2026.
 #  5. Portfolio settings and the portfolio method are chosen on 2019-2020 validation only.
 #     Optimizer (cvxpy, Clarabel): max score - factor risk penalty, gross 200%, net within +/-20%,
 #     beta neutral ex ante, sector and size neutral, max 1.5% per name, 100-500 names.

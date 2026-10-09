@@ -9,7 +9,7 @@ import pytest
 from src.config import CONFIG
 from src.ranker import _rk_labels, fit_predict_year, rank_ic, run_schedule, windows
 
-CFG = {**CONFIG, "device": "cpu", "xgb_max_trees": 100, "xgb_depth_grid": [3, 4], "test_years": [2021],
+CFG = {**CONFIG, "ranker_model": "xgb", "device": "cpu", "xgb_max_trees": 100, "xgb_depth_grid": [3, 4], "test_years": [2021],
        "xgb_fixed": {**CONFIG["xgb_fixed"], "min_child_weight": 1, "learning_rate": 0.1}}
 FEATS = ["f0", "f1", "f2", "f3"]
 

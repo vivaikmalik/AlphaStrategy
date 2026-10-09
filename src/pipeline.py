@@ -229,7 +229,7 @@ def _pipe_book_job(scored, ltc, lb, lr, lf, rm, cfg):
 
 
 def _pipe_tune(frames, feats, market, cfg, rm, vals=None):
-    """Step 10: XGB on the 2021 window per d (skipped if `vals` given), then grid over
+    """Step 10: selected ranker on the 2021 window per d (skipped if `vals` given), then grid over
     (lam_tc, lam_beta, short_me_q, lam_risk, lam_fac) by validation IR. Validation months only. -> (choice, grid, rets, vals)"""
     win = windows(cfg)[0]
     fit, vals, tasks = vals is None, dict(vals or {}), []
@@ -237,7 +237,7 @@ def _pipe_tune(frames, feats, market, cfg, rm, vals=None):
         fr = frames[d].filter(pl.col("target_month") <= win["test"][1])
         if fit:
             _, vals[d], info = fit_predict_year(fr, feats[d], win, cfg)
-            _pipe_log(f"tune: d={d} xgb val IC {info.get('val_ic')}")
+            _pipe_log(f"tune: d={d} {info['model']} val IC {info.get('val_ic')}")
         for q in cfg["short_me_q_grid"]:
             sc = _pipe_scored(vals[d], _pipe_with_short(fr, q, cfg), cfg)
             tasks += [(d, ltc, lb, q, lr, lf, sc) for ltc in cfg["lambda_tc_grid"] for lb in cfg["lambda_beta_grid"]
@@ -501,7 +501,7 @@ def _pipe_ablations(frame, runs, choice, market, cfg, rm, v4=None):
             for r in runs.values() for k in ("preds", "val")]
     books = Parallel(n_jobs=min(cfg["n_jobs"], len(jobs)), backend="loky")(
         delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm, ic, False, v4_) for p, ic, v4_ in jobs)
-    out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (XGB); missing-value flags enter from "
+    out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (selected ranker); missing-value flags enter from "
                             "ablation 3 onward; 5 = full feature set without CFI; 6 = same plus CFI feature selection (the main run, reused). val_ir/val_beta: book on 2021-window val_pred."}
     for i, (name, r) in enumerate(runs.items()):
         _, rets, n_miss = books[2 * i]
@@ -582,17 +582,18 @@ def main(cfg):
               f"beta {spec_book['beta']:.3f} | {cfg['book']} val IR {v2_val['ir']:.3f} beta {v2_val['beta']:.3f}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
-    _pipe_dump({"choice_10a": choice_10a, "choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos, "cfi": cfi_log,
-                "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
+    _pipe_dump({"choice_10a": choice_10a, "choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "cfi": cfi_log,
+               "ranker_model": cfg.get("ranker_model", "xgb"), "ranker_infos": infos,
+               "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
                 "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel,
                 "v4_tuning": v4_log, "v4_chosen": v4_params, "chosen_book_net_of_fee": net_stats},
                "settings_log.json", cfg)
 
     # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
     sets = {"1_ridge_147": (factors, "ridge", False),
-            "2_xgb_base": (factors, "xgb", False),
-            "3_plus_gru": (base + gru_cols(d), "xgb", False),
-            "4_plus_event": (base + gru_cols(d) + event_cols, "xgb", True)}
+            "2_" + cfg.get("ranker_model", "xgb") + "_base": (factors, None, False),
+            "3_plus_gru": (base + gru_cols(d), None, False),
+            "4_plus_event": (base + gru_cols(d) + event_cols, None, True)}
     runs = {}
     for name, (cols, model, hf) in sets.items():
         p, v, i = run_schedule(frame, cols, cfg, model=model)
