@@ -589,31 +589,37 @@ def main(cfg):
                 "v4_tuning": v4_log, "v4_chosen": v4_params, "chosen_book_net_of_fee": net_stats},
                "settings_log.json", cfg)
 
-    # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
-    sets = {"1_ridge_147": (factors, "ridge", False),
-            "2_" + cfg.get("ranker_model", "xgb") + "_base": (factors, None, False),
-            "3_plus_gru": (base + gru_cols(d), None, False),
-            "4_plus_event": (base + gru_cols(d) + event_cols, None, True)}
-    runs = {}
-    for name, (cols, model, hf) in sets.items():
-        p, v, i = run_schedule(frame, cols, cfg, model=model)
-        runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
-        _pipe_log(f"ablation {name} done")
-    p, v, i = run_schedule(frame, full, cfg)         # full feature set, no CFI: isolates CFI in ablation 6
-    runs["5_plus_tone"] = {"preds": p, "val": v, "infos": i, "n_features": len(full), "has_filing_ic": True}
-    _pipe_log("ablation 5_plus_tone done")
-    runs["6_plus_cfi"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
-    _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm, v4), "ablations.json", cfg)
+    if cfg.get("ablations_enabled", True):
+        # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
+        sets = {"1_ridge_147": (factors, "ridge", False),
+                "2_" + cfg.get("ranker_model", "xgb") + "_base": (factors, None, False),
+                "3_plus_gru": (base + gru_cols(d), None, False),
+                "4_plus_event": (base + gru_cols(d) + event_cols, None, True)}
+        runs = {}
+        for name, (cols, model, hf) in sets.items():
+            p, v, i = run_schedule(frame, cols, cfg, model=model)
+            runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
+            _pipe_log(f"ablation {name} done")
+        p, v, i = run_schedule(frame, full, cfg)         # full feature set, no CFI: isolates CFI in ablation 6
+        runs["5_plus_tone"] = {"preds": p, "val": v, "infos": i, "n_features": len(full), "has_filing_ic": True}
+        _pipe_log("ablation 5_plus_tone done")
+        runs["6_plus_cfi"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
+        _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm, v4), "ablations.json", cfg)
+    else:
+        _pipe_log("ablations skipped (ablations_enabled=False)")
 
-    # step 11: leakage tests incl. shuffled-label run
-    shuf, _, shuf_infos = run_schedule(frame, full, cfg, shuffle=True)
-    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos, shuf_infos, v4)
-    _pipe_dump(leak, "leakage_tests.json", cfg)
-    assert leak["filings"]["flagged_without_filing"] == 0 and leak["filings"]["filing_after_eom"] == 0,         f"leakage: filing_date after eom / flagged without filing: {leak['filings']}"
-    assert leak["window_violations"] == 0, "leakage: train < val < test window ordering violated"
-    assert not leak["train_target_month_violations"], f"leakage: training target months reach test year: {leak['train_target_month_violations']}"
-    assert not leak["target_like_features"], f"leakage: target-identical features: {leak['target_like_features']}"
-    assert leak["duplicate_permno_eom"] == 0, "leakage: duplicate (permno, eom) keys"
+    if cfg.get("leakage_enabled", True):
+        # step 11: leakage tests incl. shuffled-label run
+        shuf, _, shuf_infos = run_schedule(frame, full, cfg, shuffle=True)
+        leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos, shuf_infos, v4)
+        _pipe_dump(leak, "leakage_tests.json", cfg)
+        assert leak["filings"]["flagged_without_filing"] == 0 and leak["filings"]["filing_after_eom"] == 0,         f"leakage: filing_date after eom / flagged without filing: {leak['filings']}"
+        assert leak["window_violations"] == 0, "leakage: train < val < test window ordering violated"
+        assert not leak["train_target_month_violations"], f"leakage: training target months reach test year: {leak['train_target_month_violations']}"
+        assert not leak["target_like_features"], f"leakage: target-identical features: {leak['target_like_features']}"
+        assert leak["duplicate_permno_eom"] == 0, "leakage: duplicate (permno, eom) keys"
+    else:
+        _pipe_log("leakage tests skipped (leakage_enabled=False)")
     _pipe_log("pipeline complete")
     if cfg.get("agent_enabled"):
         try:

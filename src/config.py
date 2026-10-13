@@ -158,6 +158,8 @@ CONFIG = {
     #     group permutation importance on VALIDATION with the train-only model, keep top shares of groups, pick the
     #     subset with the best validation IC (ties -> smaller); all-147 kept if nothing beats it. Main model only.
     "cfi_enabled": True,
+    "ablations_enabled": True,              # step 12; set False for quick experiments
+    "leakage_enabled": True,                # step 11 (incl. shuffled-label run); set False for quick experiments
     "cfi_cuts": [0.65, 0.75, 0.85],         # |rho| cut levels (distance 0.35 / 0.25 / 0.15)
     "cfi_shares": [0.25, 0.50, 0.75],       # share of top-ranked groups kept
     "cfi_repeats": 3,                       # permutation seeds: seed, seed+1, seed+2

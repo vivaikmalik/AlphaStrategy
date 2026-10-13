@@ -8,7 +8,7 @@
 #     GRU autoencoder embeddings of each stock's last 11 monthly changes (trained up to 2018).
 #  4. Walk-forward: for test year Y train on 2015-02..(Y-3)-12, validate on (Y-2)..(Y-1),
 #     feature selection on the 147 characteristics (clusters + permutation importance on validation),
-#     XGBoost ranker, refit on train + validation, predict year Y. Test years 2021-2026.
+#     TabPFN return-rank regressor (optional XGBoost), refit on train + validation, predict year Y. Test years 2021-2026.
 #  5. Portfolio settings and the portfolio method are chosen on 2019-2020 validation only.
 #     Optimizer (cvxpy, Clarabel): max score - factor risk penalty, gross 200%, net within +/-20%,
 #     beta neutral ex ante, sector and size neutral, max 1.5% per name, 100-500 names.
@@ -92,7 +92,11 @@ CONFIG = {
     "gru_patience": 5,
     "gru_clip": 1.0,
 
-    # --- step 5 XGBoost ranker ---
+    # --- step 5 ranker (XGBoost remains available for comparison) ---
+    "ranker_model": "tabpfn",
+    "tabpfn_n_estimators": 4,
+    "tabpfn_max_train_samples": 1000 if SMOKE or _DEVICE == "cpu" else 10000,
+    "tabpfn_predict_batch": 1024,
     "xgb_fixed": dict(objective="rank:pairwise", learning_rate=0.03, subsample=0.7,
                       colsample_bytree=0.5, min_child_weight=200, reg_lambda=10, tree_method="hist",
                       # xgboost>=2 normalises pairwise gradients by default -> hessians so small that
@@ -177,6 +181,8 @@ CONFIG = {
     #     group permutation importance on VALIDATION with the train-only model, keep top shares of groups, pick the
     #     subset with the best validation IC (ties -> smaller); all-147 kept if nothing beats it. Main model only.
     "cfi_enabled": True,
+    "ablations_enabled": True,              # step 12; set False for quick experiments
+    "leakage_enabled": True,                # step 11 (incl. shuffled-label run); set False for quick experiments
     "cfi_cuts": [0.65, 0.75, 0.85],         # |rho| cut levels (distance 0.35 / 0.25 / 0.15)
     "cfi_shares": [0.25, 0.50, 0.75],       # share of top-ranked groups kept
     "cfi_repeats": 3,                       # permutation seeds: seed, seed+1, seed+2
@@ -754,7 +760,7 @@ def cfi_candidates(groups, importances, shares):
 
 # ===== src/ranker.py =====
 """
-src/ranker.py - Step 5: XGBRanker (rank:pairwise, qid = eom) with walk-forward windows, plus the Ridge baseline.
+src/ranker.py - Step 5: TabPFN return-rank regression with walk-forward windows; XGBoost and Ridge comparisons.
 Scores are cross-sectional only; ret_hat comes from a rank regression fitted on validation scores of the train-only model.
 """
 import calendar
@@ -762,7 +768,6 @@ from datetime import date
 
 import numpy as np
 import polars as pl
-import xgboost as xgb
 from sklearn.linear_model import Ridge
 
 
@@ -816,16 +821,73 @@ def _rk_mat(d, features):
     return d.select(features).cast(pl.Float32).to_numpy()  # nulls -> NaN (XGBoost handles them natively)
 
 
+def _rk_context_indices(eom, limit, seed):
+    """Seeded, month-balanced context sample, with no target-dependent selection."""
+    if limit < 1:
+        raise ValueError("tabpfn_max_train_samples must be positive")
+    if len(eom) <= limit:
+        return np.arange(len(eom))
+    rng = np.random.default_rng(seed)
+    _, groups = np.unique(eom.to_numpy(), return_inverse=True)
+    # Round-robin shuffled months gives each month equal opportunity, including
+    # when the sample budget is smaller than the number of months.
+    buckets = [rng.permutation(np.flatnonzero(groups == g)) for g in rng.permutation(np.unique(groups))]
+    order = []
+    for j in range(max(map(len, buckets))):
+        for bucket in buckets:
+            if j < len(bucket):
+                order.append(int(bucket[j]))
+                if len(order) == limit:
+                    return np.sort(order)
+    return np.sort(order)
+
+
+def _rk_tabpfn(cfg, X, y, eom):
+    try:
+        from tabpfn import TabPFNRegressor
+    except ImportError as exc:
+        raise ImportError("TabPFN ranker requires tabpfn; install requirements-tabpfn.txt") from exc
+    ix = _rk_context_indices(eom, cfg["tabpfn_max_train_samples"], cfg["seed"])
+    if len(ix) < 2:
+        raise ValueError("TabPFN requires at least two finite training targets")
+    labels = _rk_ranks(eom, y)  # rank BEFORE sampling, within each complete training month
+    m = TabPFNRegressor(n_estimators=cfg["tabpfn_n_estimators"], device=cfg["device"],
+                       random_state=cfg["seed"], ignore_pretraining_limits=False,
+                       fit_mode="low_memory")
+    m.fit(X[ix], labels[ix])
+    return m
+
+
+def _rk_predict(model, X, cfg, trees=None):
+    if trees is not None:
+        return model.predict(X, iteration_range=(0, trees))
+    batch = cfg.get("tabpfn_predict_batch", 1024)
+    if batch < 1:
+        raise ValueError("tabpfn_predict_batch must be positive")
+    if len(X) == 0:
+        return np.empty(0, dtype=float)
+    return np.concatenate([np.asarray(model.predict(X[i:i + batch])) for i in range(0, len(X), batch)])
+
+
 def _rk_xgb(cfg, depth, trees, X, y, e):
+    import xgboost as xgb
     kw = dict(device="cuda") if cfg["device"] == "cuda" and xgb.build_info().get("USE_CUDA") else {}
     m = xgb.XGBRanker(**cfg["xgb_fixed"], max_depth=depth, n_estimators=trees, random_state=cfg["seed"], **kw)
     m.fit(X, _rk_labels(e, y), qid=e.cast(pl.Int32).to_numpy())
     return m
 
 
-def _rk_tune(tr, va, feats, cfg, ytr, yva, grid=None):
+def _rk_tune(tr, va, feats, cfg, ytr, yva, grid=None, model="xgb"):
     """Fit on train per depth, eval val IC every eval_every trees. Returns (best_ic, depth, trees, model); fills grid if given."""
     Xtr, Xva = _rk_mat(tr, feats), _rk_mat(va, feats)
+    if model == "tabpfn":
+        m = _rk_tabpfn(cfg, Xtr, ytr, tr["eom"])
+        ic = _rk_mean_ic(va["eom"], _rk_predict(m, Xva, cfg), yva)
+        if not np.isfinite(ic):
+            raise ValueError("TabPFN validation IC is undefined; check validation rows and targets")
+        if grid is not None:
+            grid["tabpfn"] = ic
+        return ic, None, None, m
     best, best_m = (-np.inf, None, None), None
     for depth in cfg["xgb_depth_grid"]:
         m = _rk_xgb(cfg, depth, cfg["xgb_max_trees"], Xtr, ytr, tr["eom"])
@@ -838,12 +900,12 @@ def _rk_tune(tr, va, feats, cfg, ytr, yva, grid=None):
     return best[0], best[1], best[2], best_m
 
 
-def _rk_cfi_select(tr, va, features, cfg, ytr, yva, base, cfi_factors):
+def _rk_cfi_select(tr, va, features, cfg, ytr, yva, base, cfi_factors, model="xgb"):
     """CFI selection on one window (train rows cluster, val rows rank groups). Returns (feats, tuned, info)."""
     fset = set(cfi_factors)
     facs = [f for f in features if f in fset]
     bic, _, btrees, bm = base
-    pf = lambda X: bm.predict(X, iteration_range=(0, btrees))
+    pf = lambda X: _rk_predict(bm, X, cfg, btrees)
     clusters, cands, seen = cfi_clusters(tr, facs, cfg), [], set()
     for cut, groups in clusters.items():
         imps = cfi_importance(pf, va, features, groups, cfg)
@@ -854,7 +916,7 @@ def _rk_cfi_select(tr, va, features, cfg, ytr, yva, base, cfi_factors):
                 continue
             seen.add(key)
             sel = [f for f in features if f in key or f not in fset]
-            t = _rk_tune(tr, va, sel, cfg, ytr, yva)
+            t = _rk_tune(tr, va, sel, cfg, ytr, yva, model=model)
             cands.append(dict(name=f"cut{cut:.2f}_top{round(share * 100)}", n_factors=len(key), val_ic=t[0], feats=sel, tuned=t))
     best = None
     for c in cands:  # strictly better IC wins; exact ties -> fewer features
@@ -867,33 +929,39 @@ def _rk_cfi_select(tr, va, features, cfg, ytr, yva, base, cfi_factors):
     return (best["feats"], best["tuned"], info) if use else (features, base, info)
 
 
-def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False, cfi_factors=None):
+def fit_predict_year(df, features, win, cfg, model=None, shuffle=False, cfi_factors=None):
     """Tune on val (train-only fits), refit on train+val, predict the test year. Returns (test_pred, val_pred, info)."""
+    model = model or cfg.get("ranker_model", "xgb")
+    if model not in ("xgb", "tabpfn", "ridge"):
+        raise ValueError(f"Unknown ranker model: {model}")
     df = df.sort(["eom", "permno"])
     rng = lambda w: (pl.col("target_month") >= w[0]) & (pl.col("target_month") <= w[1])
-    has_y = pl.col("ret_exc_lead1m").is_not_null()
+    has_y = pl.col("ret_exc_lead1m").is_not_null() & pl.col("ret_exc_lead1m").is_finite()
     tr, va = df.filter(rng(win["train"]) & has_y), df.filter(rng(win["val"]) & has_y)
     te = df.filter(rng(win["test"]))
     va_all = df.filter(rng(win["val"]))  # incl. null-target rows: val_pred must cover every validation month-row
     ytr, yva = tr["ret_exc_lead1m"].to_numpy(), va["ret_exc_lead1m"].to_numpy()
+    if len(ytr) < 2 or len(yva) < 2:
+        raise ValueError("Ranker requires at least two finite targets in both train and validation")
     if shuffle:  # leakage test: destroy the label-feature link in train AND val
         ytr, yva = _rk_shuffle(tr["eom"], ytr, cfg["seed"]), _rk_shuffle(va["eom"], yva, cfg["seed"] + 1)
     cfi_info = None
-    if model == "xgb":
+    if model in ("xgb", "tabpfn"):
         grid = {}
-        tuned = _rk_tune(tr, va, features, cfg, ytr, yva, grid)
+        tuned = _rk_tune(tr, va, features, cfg, ytr, yva, grid, model=model)
         if cfi_factors is not None and cfg.get("cfi_enabled"):
-            features, tuned, cfi_info = _rk_cfi_select(tr, va, features, cfg, ytr, yva, tuned, cfi_factors)
+            features, tuned, cfi_info = _rk_cfi_select(tr, va, features, cfg, ytr, yva, tuned, cfi_factors, model=model)
     Xtr, Xva, Xte = _rk_mat(tr, features), _rk_mat(va, features), _rk_mat(te, features)
     Xall, yall = np.vstack([Xtr, Xva]), np.concatenate([ytr, yva])
     eall = pl.concat([tr["eom"], va["eom"]])
 
-    if model == "xgb":
+    if model in ("xgb", "tabpfn"):
         best, best_m = tuned[:3], tuned[3]
-        val_score = best_m.predict(Xva, iteration_range=(0, best[2]))
-        final = _rk_xgb(cfg, best[1], best[2], Xall, yall, eall)
-        te_score = final.predict(Xte)
-        va_all_score = best_m.predict(_rk_mat(va_all, features), iteration_range=(0, best[2]))
+        val_score = _rk_predict(best_m, Xva, cfg, best[2])
+        va_all_score = _rk_predict(best_m, _rk_mat(va_all, features), cfg, best[2])
+        final = (_rk_tabpfn(cfg, Xall, yall, eall) if model == "tabpfn"
+                 else _rk_xgb(cfg, best[1], best[2], Xall, yall, eall))
+        te_score = _rk_predict(final, Xte, cfg)
     else:  # ridge baseline on the features (template: Ridge on the 147 characteristics)
         grid, best = {}, (-np.inf, None, None)
         Xtr0, Xva0, Xte0, Xall0 = (np.nan_to_num(x) for x in (Xtr, Xva, Xte, Xall))
@@ -919,10 +987,15 @@ def fit_predict_year(df, features, win, cfg, model="xgb", shuffle=False, cfi_fac
         info["cfi"], info["features"] = cfi_info, list(features)
     if model == "ridge":
         info["best_alpha"] = best[1]
+    if model == "tabpfn":
+        info.update(n_estimators=cfg["tabpfn_n_estimators"],
+                    train_context_rows=min(len(ytr), cfg["tabpfn_max_train_samples"]),
+                    refit_context_rows=min(len(yall), cfg["tabpfn_max_train_samples"]),
+                    target="within-month return rank [-1, 1]")
     return out(te, te_score), out(va_all, va_all_score), info
 
 
-def run_schedule(df, features, cfg, model="xgb", shuffle=False, return_vals=False, cfi_factors=None):
+def run_schedule(df, features, cfg, model=None, shuffle=False, return_vals=False, cfi_factors=None):
     """Loop over test years. Returns (preds, val_2021, infos); with return_vals a 4th value {year: that window's val_pred}."""
     tests, infos, val_2021, vals = [], [], None, {}
     for w in windows(cfg):
@@ -2242,7 +2315,7 @@ def _pipe_book_job(scored, ltc, lb, lr, lf, rm, cfg):
 
 
 def _pipe_tune(frames, feats, market, cfg, rm, vals=None):
-    """Step 10: XGB on the 2021 window per d (skipped if `vals` given), then grid over
+    """Step 10: selected ranker on the 2021 window per d (skipped if `vals` given), then grid over
     (lam_tc, lam_beta, short_me_q, lam_risk, lam_fac) by validation IR. Validation months only. -> (choice, grid, rets, vals)"""
     win = windows(cfg)[0]
     fit, vals, tasks = vals is None, dict(vals or {}), []
@@ -2250,7 +2323,7 @@ def _pipe_tune(frames, feats, market, cfg, rm, vals=None):
         fr = frames[d].filter(pl.col("target_month") <= win["test"][1])
         if fit:
             _, vals[d], info = fit_predict_year(fr, feats[d], win, cfg)
-            _pipe_log(f"tune: d={d} xgb val IC {info.get('val_ic')}")
+            _pipe_log(f"tune: d={d} {info['model']} val IC {info.get('val_ic')}")
         for q in cfg["short_me_q_grid"]:
             sc = _pipe_scored(vals[d], _pipe_with_short(fr, q, cfg), cfg)
             tasks += [(d, ltc, lb, q, lr, lf, sc) for ltc in cfg["lambda_tc_grid"] for lb in cfg["lambda_beta_grid"]
@@ -2514,7 +2587,7 @@ def _pipe_ablations(frame, runs, choice, market, cfg, rm, v4=None):
             for r in runs.values() for k in ("preds", "val")]
     books = Parallel(n_jobs=min(cfg["n_jobs"], len(jobs)), backend="loky")(
         delayed(_pipe_run_book_stats)(p, frame, choice, market, cfg, rm, ic, False, v4_) for p, ic, v4_ in jobs)
-    out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (XGB); missing-value flags enter from "
+    out = {"features_note": "ablation 1 = 147 factors (ridge), 2 = the 147 factors only (selected ranker); missing-value flags enter from "
                             "ablation 3 onward; 5 = full feature set without CFI; 6 = same plus CFI feature selection (the main run, reused). val_ir/val_beta: book on 2021-window val_pred."}
     for i, (name, r) in enumerate(runs.items()):
         _, rets, n_miss = books[2 * i]
@@ -2595,37 +2668,44 @@ def main(cfg):
               f"beta {spec_book['beta']:.3f} | {cfg['book']} val IR {v2_val['ir']:.3f} beta {v2_val['beta']:.3f}")
     performance_pack(rets, weights, frame, filings, _pipe_attach_target(preds, frame), cfg)
     write_submission(weights, frame, filings, rets, cfg)
-    _pipe_dump({"choice_10a": choice_10a, "choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "xgb_infos": infos, "cfi": cfi_log,
-                "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
+    _pipe_dump({"choice_10a": choice_10a, "choice": choice, "beta_check": beta_chk, "beta_fix": beta_fix, "grid": grid, "logs": logs, "cfi": cfi_log,
+               "ranker_model": cfg.get("ranker_model", "xgb"), "ranker_infos": infos,
+               "test_ic": _pipe_ic(preds, frame, cfg), "test_ir": _pipe_ir(rets), "test_beta": _pipe_beta(rets, cfg),
                 "book": cfg["book"], "test_stats": test_stats, "spec_book": spec_book, "v2_validation": v2_val, "book_selection": book_sel,
                 "v4_tuning": v4_log, "v4_chosen": v4_params, "chosen_book_net_of_fee": net_stats},
                "settings_log.json", cfg)
 
-    # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
-    sets = {"1_ridge_147": (factors, "ridge", False),
-            "2_xgb_base": (factors, "xgb", False),
-            "3_plus_gru": (base + gru_cols(d), "xgb", False),
-            "4_plus_event": (base + gru_cols(d) + event_cols, "xgb", True)}
-    runs = {}
-    for name, (cols, model, hf) in sets.items():
-        p, v, i = run_schedule(frame, cols, cfg, model=model)
-        runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
-        _pipe_log(f"ablation {name} done")
-    p, v, i = run_schedule(frame, full, cfg)         # full feature set, no CFI: isolates CFI in ablation 6
-    runs["5_plus_tone"] = {"preds": p, "val": v, "infos": i, "n_features": len(full), "has_filing_ic": True}
-    _pipe_log("ablation 5_plus_tone done")
-    runs["6_plus_cfi"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
-    _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm, v4), "ablations.json", cfg)
+    if cfg.get("ablations_enabled", True):
+        # step 12: ablations (each run reuses the chosen lambdas / short_me_q / d)
+        sets = {"1_ridge_147": (factors, "ridge", False),
+                "2_" + cfg.get("ranker_model", "xgb") + "_base": (factors, None, False),
+                "3_plus_gru": (base + gru_cols(d), None, False),
+                "4_plus_event": (base + gru_cols(d) + event_cols, None, True)}
+        runs = {}
+        for name, (cols, model, hf) in sets.items():
+            p, v, i = run_schedule(frame, cols, cfg, model=model)
+            runs[name] = {"preds": p, "val": v, "infos": i, "n_features": len(cols), "has_filing_ic": hf}
+            _pipe_log(f"ablation {name} done")
+        p, v, i = run_schedule(frame, full, cfg)         # full feature set, no CFI: isolates CFI in ablation 6
+        runs["5_plus_tone"] = {"preds": p, "val": v, "infos": i, "n_features": len(full), "has_filing_ic": True}
+        _pipe_log("ablation 5_plus_tone done")
+        runs["6_plus_cfi"] = {"preds": preds, "val": val_2021, "infos": infos, "n_features": len(full), "has_filing_ic": True}
+        _pipe_dump(_pipe_ablations(frame, runs, choice, market, cfg, rm, v4), "ablations.json", cfg)
+    else:
+        _pipe_log("ablations skipped (ablations_enabled=False)")
 
-    # step 11: leakage tests incl. shuffled-label run
-    shuf, _, shuf_infos = run_schedule(frame, full, cfg, shuffle=True)
-    leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos, shuf_infos, v4)
-    _pipe_dump(leak, "leakage_tests.json", cfg)
-    assert leak["filings"]["flagged_without_filing"] == 0 and leak["filings"]["filing_after_eom"] == 0,         f"leakage: filing_date after eom / flagged without filing: {leak['filings']}"
-    assert leak["window_violations"] == 0, "leakage: train < val < test window ordering violated"
-    assert not leak["train_target_month_violations"], f"leakage: training target months reach test year: {leak['train_target_month_violations']}"
-    assert not leak["target_like_features"], f"leakage: target-identical features: {leak['target_like_features']}"
-    assert leak["duplicate_permno_eom"] == 0, "leakage: duplicate (permno, eom) keys"
+    if cfg.get("leakage_enabled", True):
+        # step 11: leakage tests incl. shuffled-label run
+        shuf, _, shuf_infos = run_schedule(frame, full, cfg, shuffle=True)
+        leak = _pipe_leakage(frame, filings, full, event_cols, shuf, choice, market, cfg, rm, infos, shuf_infos, v4)
+        _pipe_dump(leak, "leakage_tests.json", cfg)
+        assert leak["filings"]["flagged_without_filing"] == 0 and leak["filings"]["filing_after_eom"] == 0,         f"leakage: filing_date after eom / flagged without filing: {leak['filings']}"
+        assert leak["window_violations"] == 0, "leakage: train < val < test window ordering violated"
+        assert not leak["train_target_month_violations"], f"leakage: training target months reach test year: {leak['train_target_month_violations']}"
+        assert not leak["target_like_features"], f"leakage: target-identical features: {leak['target_like_features']}"
+        assert leak["duplicate_permno_eom"] == 0, "leakage: duplicate (permno, eom) keys"
+    else:
+        _pipe_log("leakage tests skipped (leakage_enabled=False)")
     _pipe_log("pipeline complete")
     if cfg.get("agent_enabled"):
         try:
